@@ -36,6 +36,18 @@ VALID_CANDIDATE_DECISIONS = (
     "ignored",
     "duplicate",
 )
+VALID_COMMITMENT_STATUSES = ("planned", "done", "ignored")
+VALID_COMMITMENT_TYPES = (
+    "gym",
+    "class",
+    "commute",
+    "meal",
+    "work",
+    "social",
+    "errand",
+    "personal",
+    "other",
+)
 
 
 def _connect():
@@ -231,6 +243,73 @@ def _create_course_archives_table(cursor):
     ''')
 
 
+def _create_morning_checkins_table(cursor):
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS morning_checkins (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            checkin_date TEXT NOT NULL UNIQUE,
+            available_study_minutes INTEGER CHECK (
+                available_study_minutes IS NULL OR available_study_minutes >= 0
+            ),
+            available_time_blocks TEXT,
+            fixed_commitments TEXT,
+            extra_commitments TEXT,
+            sleep_quality TEXT,
+            energy_level TEXT,
+            stress_level TEXT,
+            mood TEXT,
+            top_personal_priority TEXT,
+            avoiding_task TEXT,
+            hard_stop_time TEXT,
+            notes TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+    ''')
+
+
+def _create_personal_commitments_table(cursor):
+    allowed_statuses = "', '".join(VALID_COMMITMENT_STATUSES)
+    allowed_types = "', '".join(VALID_COMMITMENT_TYPES)
+    cursor.execute(f'''
+        CREATE TABLE IF NOT EXISTS personal_commitments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            commitment_type TEXT CHECK (
+                commitment_type IS NULL
+                OR commitment_type IN ('{allowed_types}')
+            ),
+            planned_date TEXT,
+            start_time TEXT,
+            estimated_minutes INTEGER CHECK (
+                estimated_minutes IS NULL OR estimated_minutes > 0
+            ),
+            priority INTEGER DEFAULT 3 CHECK (
+                priority IS NULL OR priority BETWEEN 1 AND 5
+            ),
+            status TEXT DEFAULT 'planned' CHECK (
+                status IN ('{allowed_statuses}')
+            ),
+            notes TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+    ''')
+
+
+def _create_daily_commands_table(cursor):
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS daily_commands (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            command_date TEXT NOT NULL,
+            input_summary_json TEXT,
+            output_json TEXT,
+            raw_response TEXT,
+            created_at TEXT
+        )
+    ''')
+
+
 def _table_columns(cursor, table_name):
     cursor.execute(f"PRAGMA table_info({table_name})")
     return [row["name"] for row in cursor.fetchall()]
@@ -280,6 +359,12 @@ def _database_needs_backup_before_init():
         ai_boss_briefings_missing = not _table_exists(cursor, "ai_boss_briefings")
         task_candidates_missing = not _table_exists(cursor, "task_candidates")
         course_archives_missing = not _table_exists(cursor, "course_archives")
+        morning_checkins_missing = not _table_exists(cursor, "morning_checkins")
+        personal_commitments_missing = not _table_exists(
+            cursor,
+            "personal_commitments",
+        )
+        daily_commands_missing = not _table_exists(cursor, "daily_commands")
         return (
             tasks_need_migration
             or daily_reviews_missing
@@ -287,6 +372,9 @@ def _database_needs_backup_before_init():
             or ai_boss_briefings_missing
             or task_candidates_missing
             or course_archives_missing
+            or morning_checkins_missing
+            or personal_commitments_missing
+            or daily_commands_missing
         )
 
 
@@ -488,11 +576,17 @@ def init_db():
         _create_study_sessions_table(cursor)
         _create_task_candidates_table(cursor)
         _create_course_archives_table(cursor)
+        _create_morning_checkins_table(cursor)
+        _create_personal_commitments_table(cursor)
+        _create_daily_commands_table(cursor)
         conn.commit()
 
     init_daily_reviews_table(create_backup=False)
     init_agent_memory_table(create_backup=False)
     init_ai_boss_briefings_table(create_backup=False)
+    init_morning_checkins_table(create_backup=False)
+    init_personal_commitments_table(create_backup=False)
+    init_daily_commands_table(create_backup=False)
     score_unscored_active_tasks()
 
 
@@ -561,6 +655,60 @@ def init_ai_boss_briefings_table(create_backup=True):
     with closing(_connect()) as conn:
         cursor = conn.cursor()
         _create_ai_boss_briefings_table(cursor)
+        conn.commit()
+
+
+def init_morning_checkins_table(create_backup=True):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    missing = True
+    if DB_PATH.exists():
+        with closing(_connect()) as conn:
+            cursor = conn.cursor()
+            missing = not _table_exists(cursor, "morning_checkins")
+
+    if missing and create_backup:
+        backup_database()
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        _create_morning_checkins_table(cursor)
+        conn.commit()
+
+
+def init_personal_commitments_table(create_backup=True):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    missing = True
+    if DB_PATH.exists():
+        with closing(_connect()) as conn:
+            cursor = conn.cursor()
+            missing = not _table_exists(cursor, "personal_commitments")
+
+    if missing and create_backup:
+        backup_database()
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        _create_personal_commitments_table(cursor)
+        conn.commit()
+
+
+def init_daily_commands_table(create_backup=True):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    missing = True
+    if DB_PATH.exists():
+        with closing(_connect()) as conn:
+            cursor = conn.cursor()
+            missing = not _table_exists(cursor, "daily_commands")
+
+    if missing and create_backup:
+        backup_database()
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        _create_daily_commands_table(cursor)
         conn.commit()
 
 
@@ -1067,6 +1215,340 @@ def export_daily_reviews_to_csv(output_path):
         writer.writerows(reviews)
 
     return str(output_path)
+
+
+def _clean_optional_int(value, minimum=None, maximum=None):
+    if value in (None, ""):
+        return None
+
+    number = int(value)
+    if minimum is not None and number < minimum:
+        raise ValueError(f"Value must be at least {minimum}.")
+    if maximum is not None and number > maximum:
+        raise ValueError(f"Value must be at most {maximum}.")
+    return number
+
+
+def _clean_time_text(value):
+    text = _clean_review_text(value)
+    if not text:
+        return None
+
+    try:
+        datetime.strptime(text, "%H:%M")
+    except ValueError as error:
+        raise ValueError("Time must use HH:MM format.") from error
+    return text
+
+
+def _normalize_choice(value, valid_values, default=None, field_name="Value"):
+    text = _clean_review_text(value)
+    if not text:
+        return default
+
+    text = text.lower()
+    if text not in valid_values:
+        raise ValueError(f"{field_name} must be one of: {', '.join(valid_values)}.")
+    return text
+
+
+def _normalize_morning_checkin(checkin):
+    return {
+        "checkin_date": _clean_review_date(checkin.get("checkin_date")),
+        "available_study_minutes": _clean_optional_int(
+            checkin.get("available_study_minutes"),
+            minimum=0,
+        ),
+        "available_time_blocks": _clean_review_text(
+            checkin.get("available_time_blocks")
+        ),
+        "fixed_commitments": _clean_review_text(checkin.get("fixed_commitments")),
+        "extra_commitments": _clean_review_text(checkin.get("extra_commitments")),
+        "sleep_quality": _clean_review_text(checkin.get("sleep_quality")),
+        "energy_level": _clean_review_text(checkin.get("energy_level")),
+        "stress_level": _clean_review_text(checkin.get("stress_level")),
+        "mood": _clean_review_text(checkin.get("mood")),
+        "top_personal_priority": _clean_review_text(
+            checkin.get("top_personal_priority")
+        ),
+        "avoiding_task": _clean_review_text(checkin.get("avoiding_task")),
+        "hard_stop_time": _clean_time_text(checkin.get("hard_stop_time")),
+        "notes": _clean_review_text(checkin.get("notes")),
+    }
+
+
+def create_or_update_morning_checkin(checkin):
+    checkin = _normalize_morning_checkin(checkin)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO morning_checkins (
+                checkin_date, available_study_minutes, available_time_blocks,
+                fixed_commitments, extra_commitments, sleep_quality,
+                energy_level, stress_level, mood, top_personal_priority,
+                avoiding_task, hard_stop_time, notes, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(checkin_date) DO UPDATE SET
+                available_study_minutes = excluded.available_study_minutes,
+                available_time_blocks = excluded.available_time_blocks,
+                fixed_commitments = excluded.fixed_commitments,
+                extra_commitments = excluded.extra_commitments,
+                sleep_quality = excluded.sleep_quality,
+                energy_level = excluded.energy_level,
+                stress_level = excluded.stress_level,
+                mood = excluded.mood,
+                top_personal_priority = excluded.top_personal_priority,
+                avoiding_task = excluded.avoiding_task,
+                hard_stop_time = excluded.hard_stop_time,
+                notes = excluded.notes,
+                updated_at = excluded.updated_at
+            ''',
+            (
+                checkin["checkin_date"],
+                checkin["available_study_minutes"],
+                checkin["available_time_blocks"],
+                checkin["fixed_commitments"],
+                checkin["extra_commitments"],
+                checkin["sleep_quality"],
+                checkin["energy_level"],
+                checkin["stress_level"],
+                checkin["mood"],
+                checkin["top_personal_priority"],
+                checkin["avoiding_task"],
+                checkin["hard_stop_time"],
+                checkin["notes"],
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+
+    return get_morning_checkin_by_date(checkin["checkin_date"])
+
+
+def get_morning_checkin_by_date(checkin_date):
+    checkin_date = _clean_review_date(checkin_date)
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, checkin_date, available_study_minutes,
+                   available_time_blocks, fixed_commitments,
+                   extra_commitments, sleep_quality, energy_level,
+                   stress_level, mood, top_personal_priority, avoiding_task,
+                   hard_stop_time, notes, created_at, updated_at
+            FROM morning_checkins
+            WHERE checkin_date = ?
+            LIMIT 1
+            ''',
+            (checkin_date,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def get_recent_morning_checkins(limit=7):
+    limit = max(1, int(limit))
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, checkin_date, available_study_minutes,
+                   available_time_blocks, fixed_commitments,
+                   extra_commitments, sleep_quality, energy_level,
+                   stress_level, mood, top_personal_priority, avoiding_task,
+                   hard_stop_time, notes, created_at, updated_at
+            FROM morning_checkins
+            ORDER BY checkin_date DESC, updated_at DESC
+            LIMIT ?
+            ''',
+            (limit,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def _normalize_personal_commitment(commitment):
+    title = _clean_review_text(commitment.get("title"))
+    if not title:
+        raise ValueError("Commitment title is required.")
+
+    commitment_type = _normalize_choice(
+        commitment.get("commitment_type"),
+        VALID_COMMITMENT_TYPES,
+        default="other",
+        field_name="Commitment type",
+    )
+    status = _normalize_choice(
+        commitment.get("status"),
+        VALID_COMMITMENT_STATUSES,
+        default="planned",
+        field_name="Commitment status",
+    )
+
+    return {
+        "title": title,
+        "commitment_type": commitment_type,
+        "planned_date": _clean_review_date(commitment.get("planned_date")),
+        "start_time": _clean_time_text(commitment.get("start_time")),
+        "estimated_minutes": _clean_optional_int(
+            commitment.get("estimated_minutes"),
+            minimum=1,
+        ),
+        "priority": _clean_optional_int(commitment.get("priority"), 1, 5) or 3,
+        "status": status,
+        "notes": _clean_review_text(commitment.get("notes")),
+    }
+
+
+def create_personal_commitment(commitment):
+    commitment = _normalize_personal_commitment(commitment)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO personal_commitments (
+                title, commitment_type, planned_date, start_time,
+                estimated_minutes, priority, status, notes,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                commitment["title"],
+                commitment["commitment_type"],
+                commitment["planned_date"],
+                commitment["start_time"],
+                commitment["estimated_minutes"],
+                commitment["priority"],
+                commitment["status"],
+                commitment["notes"],
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_personal_commitments_for_date(planned_date, include_ignored=False):
+    planned_date = _clean_review_date(planned_date)
+    status_clause = "" if include_ignored else "AND status != 'ignored'"
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f'''
+            SELECT id, title, commitment_type, planned_date, start_time,
+                   estimated_minutes, priority, status, notes,
+                   created_at, updated_at
+            FROM personal_commitments
+            WHERE planned_date = ?
+              {status_clause}
+            ORDER BY
+                CASE WHEN start_time IS NULL THEN 1 ELSE 0 END,
+                start_time ASC,
+                priority DESC,
+                created_at DESC
+            ''',
+            (planned_date,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def update_personal_commitment_status(commitment_id, status):
+    status = _normalize_choice(
+        status,
+        VALID_COMMITMENT_STATUSES,
+        field_name="Commitment status",
+    )
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            UPDATE personal_commitments
+            SET status = ?, updated_at = ?
+            WHERE id = ?
+            ''',
+            (status, now, commitment_id),
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
+def save_daily_command(
+    command_date,
+    input_summary_json,
+    output_json,
+    raw_response=None,
+):
+    command_date = _clean_review_date(command_date)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO daily_commands (
+                command_date, input_summary_json, output_json,
+                raw_response, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ''',
+            (
+                command_date,
+                input_summary_json,
+                output_json,
+                raw_response,
+                now,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_latest_daily_command(command_date=None):
+    params = ()
+    where_clause = ""
+    if command_date:
+        where_clause = "WHERE command_date = ?"
+        params = (_clean_review_date(command_date),)
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f'''
+            SELECT id, command_date, input_summary_json, output_json,
+                   raw_response, created_at
+            FROM daily_commands
+            {where_clause}
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            ''',
+            params,
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def get_recent_daily_commands(limit=7):
+    limit = max(1, int(limit))
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, command_date, input_summary_json, output_json,
+                   raw_response, created_at
+            FROM daily_commands
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            ''',
+            (limit,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
 
 
 def _clean_memory_text(value):

@@ -20,11 +20,20 @@ from canvas_client import (
     has_canvas_api_token,
     has_canvas_base_url,
 )
+from daily_command import (
+    DailyCommandConfigError,
+    DailyCommandResponseError,
+    build_daily_command_context,
+    generate_daily_command,
+    has_openai_api_key as has_daily_command_api_key,
+)
 from db import (
     archive_course,
     complete_study_session,
     create_agent_memory,
+    create_or_update_morning_checkin,
     create_or_update_daily_review,
+    create_personal_commitment,
     create_task,
     create_canvas_assignment_task,
     create_study_session_start,
@@ -34,10 +43,14 @@ from db import (
     get_active_agent_memory,
     get_all_tasks,
     get_daily_review_by_date,
+    get_latest_daily_command,
     get_latest_ai_boss_briefing,
     get_course_summaries,
+    get_morning_checkin_by_date,
     memory_exists,
+    get_personal_commitments_for_date,
     get_task_candidates,
+    get_recent_daily_commands,
     get_recent_ai_boss_briefings,
     get_recent_study_sessions,
     get_recent_daily_reviews,
@@ -48,8 +61,10 @@ from db import (
     init_db,
     promote_candidate_to_task,
     rescore_all_active_tasks,
+    save_daily_command,
     save_ai_boss_briefing,
     unarchive_course,
+    update_personal_commitment_status,
     update_task_candidate_decision,
     update_task_status,
 )
@@ -63,6 +78,7 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 EXPORT_DIR = BASE_DIR / "data" / "exports"
 
 MENU_OPTIONS = [
+    "Daily Command",
     "Today Plan",
     "AI Boss",
     "Task Intake",
@@ -119,6 +135,18 @@ MEMORY_SOURCES = [
     "daily_reviews",
     "ai_summary_later",
     "system",
+]
+
+COMMITMENT_TYPES = [
+    "gym",
+    "class",
+    "commute",
+    "meal",
+    "work",
+    "social",
+    "errand",
+    "personal",
+    "other",
 ]
 
 DEFAULT_AGENT_MEMORIES = [
@@ -690,6 +718,470 @@ def render_ai_boss():
     render_ai_boss_generate(context, task_lookup)
     render_latest_ai_boss_briefing(task_lookup)
     render_recent_ai_boss_briefings()
+
+
+def checkin_text_value(checkin, key):
+    if not checkin:
+        return ""
+    return checkin.get(key) or ""
+
+
+def checkin_select_index(checkin, key):
+    options = ["low", "medium", "high"]
+    if not checkin or checkin.get(key) not in options:
+        return 1
+    return options.index(checkin[key])
+
+
+def render_morning_checkin_form(command_date):
+    st.markdown("### Morning Check-In")
+    existing_checkin = get_morning_checkin_by_date(command_date)
+    if existing_checkin:
+        st.caption("A morning check-in already exists for this date. Saving updates it.")
+
+    with st.form("morning_checkin_form"):
+        available_study_minutes = st.number_input(
+            "Available study minutes today",
+            min_value=0,
+            value=existing_checkin.get("available_study_minutes") or 180
+            if existing_checkin else 180,
+            step=15,
+        )
+        available_time_blocks = st.text_area(
+            "When can you study today?",
+            value=checkin_text_value(existing_checkin, "available_time_blocks"),
+            placeholder="Example: 10:00-12:00, 15:00-17:30",
+        )
+        fixed_commitments = st.text_area(
+            "Fixed commitments today",
+            value=checkin_text_value(existing_checkin, "fixed_commitments"),
+            placeholder="Classes, work, commute, appointments...",
+        )
+        extra_commitments = st.text_area(
+            "Extra things you want to do today",
+            value=checkin_text_value(existing_checkin, "extra_commitments"),
+            placeholder="Gym, laundry, groceries, cleaning, social plans...",
+        )
+
+        columns = st.columns(3)
+        sleep_quality = columns[0].selectbox(
+            "Sleep quality",
+            options=["low", "medium", "high"],
+            index=checkin_select_index(existing_checkin, "sleep_quality"),
+        )
+        energy_level = columns[1].selectbox(
+            "Energy level",
+            options=["low", "medium", "high"],
+            index=checkin_select_index(existing_checkin, "energy_level"),
+        )
+        stress_level = columns[2].selectbox(
+            "Stress level",
+            options=["low", "medium", "high"],
+            index=checkin_select_index(existing_checkin, "stress_level"),
+        )
+
+        mood = st.text_input(
+            "Mood",
+            value=checkin_text_value(existing_checkin, "mood"),
+            placeholder="Example: calm, anxious, tired, okay",
+        )
+        top_personal_priority = st.text_input(
+            "One personal priority today",
+            value=checkin_text_value(existing_checkin, "top_personal_priority"),
+            placeholder="Example: go to the gym, call family, clean room",
+        )
+        avoiding_task = st.text_input(
+            "What task are you most likely to avoid?",
+            value=checkin_text_value(existing_checkin, "avoiding_task"),
+        )
+        hard_stop_time = st.text_input(
+            "Hard stop time (HH:MM, optional)",
+            value=checkin_text_value(existing_checkin, "hard_stop_time"),
+            placeholder="Example: 22:30",
+        )
+        notes = st.text_area(
+            "Anything else the agent should know?",
+            value=checkin_text_value(existing_checkin, "notes"),
+        )
+        submitted = st.form_submit_button("Save Morning Check-In")
+
+    if submitted:
+        try:
+            create_or_update_morning_checkin({
+                "checkin_date": command_date,
+                "available_study_minutes": available_study_minutes,
+                "available_time_blocks": available_time_blocks,
+                "fixed_commitments": fixed_commitments,
+                "extra_commitments": extra_commitments,
+                "sleep_quality": sleep_quality,
+                "energy_level": energy_level,
+                "stress_level": stress_level,
+                "mood": mood,
+                "top_personal_priority": top_personal_priority,
+                "avoiding_task": avoiding_task,
+                "hard_stop_time": hard_stop_time,
+                "notes": notes,
+            })
+        except ValueError as error:
+            st.error(str(error))
+        else:
+            st.success("Morning check-in saved.")
+
+
+def render_add_personal_commitment(command_date):
+    st.markdown("### Add Personal Commitment")
+    with st.form("personal_commitment_form"):
+        title = st.text_input(
+            "Commitment title",
+            placeholder="Example: Gym, groceries, laundry",
+        )
+        columns = st.columns(4)
+        commitment_type = columns[0].selectbox(
+            "Type",
+            options=COMMITMENT_TYPES,
+            index=COMMITMENT_TYPES.index("personal"),
+        )
+        start_time = columns[1].text_input(
+            "Start time",
+            placeholder="HH:MM",
+        )
+        estimated_minutes = columns[2].number_input(
+            "Minutes",
+            min_value=1,
+            value=60,
+            step=15,
+        )
+        priority = columns[3].slider("Priority", 1, 5, value=3)
+        notes = st.text_area("Notes")
+        submitted = st.form_submit_button("Add Commitment")
+
+    if submitted:
+        try:
+            create_personal_commitment({
+                "title": title,
+                "commitment_type": commitment_type,
+                "planned_date": command_date,
+                "start_time": start_time,
+                "estimated_minutes": estimated_minutes,
+                "priority": priority,
+                "status": "planned",
+                "notes": notes,
+            })
+        except ValueError as error:
+            st.error(str(error))
+        else:
+            st.success("Personal commitment added.")
+            st.rerun()
+
+
+def render_personal_commitments(command_date):
+    render_add_personal_commitment(command_date)
+    st.markdown("### Today's Personal Commitments")
+    commitments = get_personal_commitments_for_date(
+        command_date,
+        include_ignored=True,
+    )
+    if not commitments:
+        st.info("No personal commitments added for this date yet.")
+        return
+
+    for commitment in commitments:
+        with st.container(border=True):
+            st.markdown(f"#### {display_value(commitment['title'])}")
+            columns = st.columns(5)
+            columns[0].markdown(
+                f"**Type**  \n{display_value(commitment['commitment_type'])}"
+            )
+            columns[1].markdown(
+                f"**Start**  \n{display_value(commitment['start_time'])}"
+            )
+            columns[2].markdown(
+                f"**Minutes**  \n{display_value(commitment['estimated_minutes'])}"
+            )
+            columns[3].markdown(
+                f"**Priority**  \n{display_value(commitment['priority'])}"
+            )
+            columns[4].markdown(
+                f"**Status**  \n{display_value(commitment['status'])}"
+            )
+            st.markdown(f"**Notes**  \n{display_value(commitment['notes'])}")
+
+            columns = st.columns(2)
+            with columns[0]:
+                if st.button(
+                    "Mark Done",
+                    key=f"commitment-done-{commitment['id']}",
+                    disabled=commitment["status"] == "done",
+                ):
+                    update_personal_commitment_status(commitment["id"], "done")
+                    st.success("Commitment marked done.")
+                    st.rerun()
+            with columns[1]:
+                if st.button(
+                    "Ignore",
+                    key=f"commitment-ignore-{commitment['id']}",
+                    disabled=commitment["status"] == "ignored",
+                ):
+                    update_personal_commitment_status(commitment["id"], "ignored")
+                    st.success("Commitment ignored.")
+                    st.rerun()
+
+
+def current_daily_command_context(command_date):
+    tasks = get_all_tasks()
+    command_day = datetime.strptime(command_date, "%Y-%m-%d").date()
+    today_plan = generate_today_plan(tasks, max_tasks=3, today=command_day)
+    checkin = get_morning_checkin_by_date(command_date)
+    commitments = get_personal_commitments_for_date(command_date)
+    recent_sessions = get_recent_study_sessions(limit=20)
+    recent_reviews = get_recent_daily_reviews(limit=7)
+    memories = get_active_agent_memory()
+
+    context = build_daily_command_context(
+        tasks=tasks,
+        today_plan=today_plan,
+        morning_checkin=checkin,
+        personal_commitments=commitments,
+        recent_study_sessions=recent_sessions,
+        recent_daily_reviews=recent_reviews,
+        active_memories=memories,
+        current_date=command_date,
+    )
+    return context, tasks
+
+
+def render_daily_command_status(context):
+    st.markdown("### Status")
+    key_present = has_daily_command_api_key()
+    st.markdown(f"**OPENAI_API_KEY configured:** {'Yes' if key_present else 'No'}")
+    if not key_present:
+        st.warning(
+            "Add OPENAI_API_KEY to your .env file to generate a Daily Command."
+        )
+    if not context.get("morning_checkin"):
+        st.warning("Save the Morning Check-In first so the plan has today's context.")
+
+    counts = context["counts"]
+    columns = st.columns(4)
+    columns[0].metric("Active Tasks", counts["active_tasks"])
+    columns[1].metric("Today Plan", counts["today_plan_items"])
+    columns[2].metric("Commitments", counts["personal_commitments"])
+    columns[3].metric("Memories", counts["active_memories"])
+
+
+def parse_saved_daily_command(record):
+    if not record or not record.get("output_json"):
+        return None
+
+    try:
+        return json.loads(record["output_json"])
+    except json.JSONDecodeError:
+        return None
+
+
+def render_daily_command_task_card(task, task_lookup):
+    task_id = task.get("task_id")
+    existing_task = task_lookup.get(str(task_id)) if task_id else None
+
+    with st.container(border=True):
+        st.markdown(f"#### {display_value(task.get('title'))}")
+        columns = st.columns(3)
+        columns[0].markdown(f"**Course**  \n{display_value(task.get('course'))}")
+        columns[1].markdown(
+            "**Estimated**  \n"
+            f"{display_value(task.get('estimated_minutes'))} min"
+        )
+        columns[2].markdown(f"**Task ID**  \n{display_value(task_id)}")
+
+        if existing_task:
+            columns = st.columns(3)
+            columns[0].markdown(
+                f"**Status**  \n{display_value(existing_task.get('status'))}"
+            )
+            columns[1].markdown(
+                f"**Due**  \n{display_value(existing_task.get('due_at'))}"
+            )
+            columns[2].markdown(
+                f"**Urgency**  \n{display_value(existing_task.get('urgency_label'))}"
+            )
+
+        st.markdown(f"**Reason**  \n{display_value(task.get('reason'))}")
+        st.markdown(
+            f"**First action**  \n{display_value(task.get('first_action'))}"
+        )
+
+
+def render_daily_command_output(command, task_lookup):
+    if not command:
+        st.info("No Daily Command to display yet.")
+        return
+
+    st.markdown("### Executive Summary")
+    st.write(display_value(command.get("executive_summary")))
+
+    st.markdown("### Main Tasks")
+    main_tasks = command.get("main_tasks") or []
+    if not main_tasks:
+        st.info("No main tasks were returned.")
+    for task in main_tasks[:3]:
+        render_daily_command_task_card(task, task_lookup)
+
+    commitments = command.get("personal_commitments") or []
+    if commitments:
+        st.markdown("### Personal Commitments")
+        for item in commitments:
+            with st.container(border=True):
+                st.markdown(f"#### {display_value(item.get('title'))}")
+                st.markdown(
+                    f"**Time advice**  \n{display_value(item.get('time_advice'))}"
+                )
+                st.markdown(f"**Reason**  \n{display_value(item.get('reason'))}")
+
+    time_blocks = command.get("time_blocks") or []
+    if time_blocks:
+        st.markdown("### Suggested Blocks")
+        for block in time_blocks:
+            with st.container(border=True):
+                columns = st.columns(3)
+                columns[0].markdown(
+                    f"**Start**  \n{display_value(block.get('start_time'))}"
+                )
+                columns[1].markdown(f"**Label**  \n{display_value(block.get('label'))}")
+                columns[2].markdown(
+                    f"**Minutes**  \n{display_value(block.get('minutes'))}"
+                )
+                st.markdown(f"**Focus**  \n{display_value(block.get('focus'))}")
+                st.markdown(f"**Notes**  \n{display_value(block.get('notes'))}")
+
+    st.markdown("### First 25-Minute Action")
+    st.write(display_value(command.get("first_25_minute_action")))
+
+    avoid_doing = command.get("avoid_doing") or []
+    if avoid_doing:
+        st.markdown("### Avoid Doing")
+        for item in avoid_doing:
+            st.markdown(f"- {display_value(item)}")
+
+    if command.get("risk_warning"):
+        st.markdown("### Risk Warning")
+        st.warning(command["risk_warning"])
+
+    st.markdown("### Schedule Advice")
+    st.write(display_value(command.get("schedule_advice")))
+
+    st.markdown("### End-of-Day Review Prompt")
+    st.write(display_value(command.get("end_of_day_review_prompt")))
+
+
+def render_daily_command_generate(context, task_lookup):
+    st.markdown("### Generate Daily Command")
+    st.caption(
+        "Daily Command uses your morning check-in, tasks, Today Plan, focus "
+        "sessions, daily reviews, and active memories. It does not update tasks."
+    )
+
+    key_present = has_daily_command_api_key()
+    ready = key_present and bool(context.get("morning_checkin"))
+    if st.button("Generate Daily Command", disabled=not ready):
+        with st.spinner("Generating Daily Command..."):
+            try:
+                command = generate_daily_command(context)
+                raw_response = command.get("_raw_response")
+                command_for_save = {
+                    key: value for key, value in command.items()
+                    if key != "_raw_response"
+                }
+                save_daily_command(
+                    command_date=context["current_date"],
+                    input_summary_json=json.dumps(context, ensure_ascii=False),
+                    output_json=json.dumps(command_for_save, ensure_ascii=False),
+                    raw_response=raw_response,
+                )
+            except DailyCommandConfigError as error:
+                st.error(str(error))
+                return
+            except DailyCommandResponseError as error:
+                st.error(str(error))
+                if error.raw_response:
+                    st.text_area(
+                        "Raw AI response",
+                        value=error.raw_response,
+                        height=240,
+                    )
+                return
+            except Exception as error:
+                st.error(f"Could not generate Daily Command: {error}")
+                return
+
+        st.success("Daily Command saved.")
+        render_daily_command_output(command_for_save, task_lookup)
+
+
+def render_latest_daily_command(command_date, task_lookup):
+    st.markdown("### Latest Daily Command")
+    latest = get_latest_daily_command(command_date)
+    if not latest:
+        st.info("No Daily Command saved for this date yet.")
+        return
+
+    st.caption(
+        f"Saved {display_datetime(latest['created_at'])} "
+        f"for {latest['command_date']}."
+    )
+    command = parse_saved_daily_command(latest)
+    if not command:
+        st.warning("The latest saved Daily Command could not be parsed.")
+        return
+    render_daily_command_output(command, task_lookup)
+
+
+def render_recent_daily_commands():
+    st.markdown("### Recent Daily Commands")
+    commands = get_recent_daily_commands(limit=7)
+    if not commands:
+        st.info("No saved Daily Commands yet.")
+        return
+
+    for record in commands:
+        command = parse_saved_daily_command(record)
+        title = (
+            f"{record['command_date']} - "
+            f"{display_datetime(record['created_at'])}"
+        )
+        with st.expander(title):
+            if not command:
+                st.warning("This saved Daily Command could not be parsed.")
+                continue
+            st.markdown(
+                f"**Summary**  \n{display_value(command.get('executive_summary'))}"
+            )
+            st.markdown(
+                "**First 25-minute action**  \n"
+                f"{display_value(command.get('first_25_minute_action'))}"
+            )
+
+
+def render_daily_command():
+    st.subheader("Daily Command")
+    st.info(
+        "Daily Command starts with a morning check-in, then creates a realistic "
+        "plan for your school tasks and personal commitments. It only generates "
+        "a plan when you click the button."
+    )
+
+    selected_date = st.date_input("Daily Command date", value=date.today())
+    command_date = selected_date.isoformat()
+
+    render_morning_checkin_form(command_date)
+    render_personal_commitments(command_date)
+
+    context, tasks = current_daily_command_context(command_date)
+    task_lookup = task_lookup_by_id(tasks)
+
+    render_daily_command_status(context)
+    render_daily_command_generate(context, task_lookup)
+    render_latest_daily_command(command_date, task_lookup)
+    render_recent_daily_commands()
 
 
 def file_extraction_key(filename, extracted_text):
@@ -1670,7 +2162,9 @@ def main():
 
     choice = st.sidebar.selectbox("Menu", MENU_OPTIONS)
 
-    if choice == "Today Plan":
+    if choice == "Daily Command":
+        render_daily_command()
+    elif choice == "Today Plan":
         render_today_plan()
     elif choice == "AI Boss":
         render_ai_boss()
