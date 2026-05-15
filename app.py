@@ -15,6 +15,14 @@ from ai_boss import (
     has_openai_api_key,
 )
 from ai_parser import extract_tasks_from_text
+from behavior_design import (
+    BehaviorDesignConfigError,
+    BehaviorDesignResponseError,
+    behavior_updates_for_task,
+    build_behavior_design_context,
+    generate_behavior_design_plan,
+    has_openai_api_key as has_behavior_design_api_key,
+)
 from canvas_client import (
     get_all_assignments,
     get_canvas_base_url,
@@ -49,6 +57,7 @@ from db import (
     create_checkin_answer,
     create_command_center_message,
     create_or_update_morning_checkin,
+    create_or_update_behavior_plan,
     create_or_update_daily_review,
     create_personal_commitment,
     create_task,
@@ -64,6 +73,7 @@ from db import (
     get_daily_command_review_by_command,
     get_latest_daily_command,
     get_latest_ai_boss_briefing,
+    get_behavior_plan_by_date,
     get_course_summaries,
     get_morning_checkin_by_date,
     get_pending_agent_memory_candidates,
@@ -74,6 +84,7 @@ from db import (
     get_recent_daily_commands,
     get_recent_daily_command_reviews,
     get_recent_ai_boss_briefings,
+    get_recent_behavior_plans,
     get_recent_study_sessions,
     get_recent_daily_reviews,
     get_tasks_by_status,
@@ -90,6 +101,7 @@ from db import (
     promote_memory_candidate_to_memory,
     unarchive_course,
     update_agent_memory_candidate_decision,
+    update_task_behavior_fields,
     update_personal_commitment_status,
     update_task_candidate_decision,
     update_task_status,
@@ -117,6 +129,7 @@ ADVANCED_MENU_OPTIONS = [
     "This Week",
     "Today Plan",
     "Daily Command",
+    "Behavior Design",
     "Feedback Loop",
     "AI Boss",
     "Task Intake",
@@ -390,6 +403,37 @@ def render_task_fields(task):
         third_row[2].markdown(
             f"**Source Snippet**  \n{display_value(task.get('source_snippet'))}"
         )
+
+    behavior_fields = [
+        task.get("first_action"),
+        task.get("next_action"),
+        task.get("behavior_prompt"),
+        task.get("energy_level"),
+        task.get("emotional_friction"),
+        task.get("avoidance_risk"),
+    ]
+    if any(behavior_fields):
+        st.markdown("**Behavior Design**")
+        if task.get("first_action"):
+            st.markdown(f"**First action:** {task['first_action']}")
+        if task.get("next_action"):
+            st.markdown(f"**Next 25 minutes:** {task['next_action']}")
+
+        behavior_row = st.columns(4)
+        behavior_row[0].markdown(
+            f"**Energy**  \n{display_value(task.get('energy_level'))}"
+        )
+        behavior_row[1].markdown(
+            f"**Load**  \n{display_value(task.get('cognitive_load'))}"
+        )
+        behavior_row[2].markdown(
+            f"**Friction**  \n{display_value(task.get('emotional_friction'))}"
+        )
+        behavior_row[3].markdown(
+            f"**Avoidance**  \n{display_value(task.get('avoidance_risk'))}"
+        )
+        if task.get("behavior_prompt"):
+            st.caption(task["behavior_prompt"])
 
 
 def render_status_actions(task, current_view):
@@ -754,6 +798,395 @@ def render_ai_boss():
     render_ai_boss_generate(context, task_lookup)
     render_latest_ai_boss_briefing(task_lookup)
     render_recent_ai_boss_briefings()
+
+
+def parse_saved_behavior_plan(record):
+    if not record or not record.get("output_json"):
+        return None
+
+    try:
+        return json.loads(record["output_json"])
+    except json.JSONDecodeError:
+        return None
+
+
+def current_behavior_design_context(plan_date, user_checkin_text=None):
+    tasks = get_all_tasks()
+    command_day = datetime.strptime(plan_date, "%Y-%m-%d").date()
+    today_plan = generate_today_plan(tasks, max_tasks=3, today=command_day)
+    ai_boss_record = get_latest_ai_boss_briefing(plan_date)
+    ai_boss_briefing = parse_saved_ai_boss_briefing(ai_boss_record)
+    recent_sessions = get_recent_study_sessions(limit=20)
+    recent_reviews = get_recent_daily_reviews(limit=7)
+    memories = get_active_agent_memory()
+
+    context = build_behavior_design_context(
+        tasks=tasks,
+        today_plan=today_plan,
+        ai_boss_briefing=ai_boss_briefing,
+        recent_focus_sessions=recent_sessions,
+        recent_daily_reviews=recent_reviews,
+        active_memories=memories,
+        current_date=plan_date,
+        user_checkin_text=user_checkin_text,
+    )
+    return context, tasks
+
+
+def behavior_plan_for_save(plan):
+    return {
+        key: value for key, value in plan.items()
+        if key != "_raw_response"
+    }
+
+
+def save_behavior_plan(plan, context):
+    raw_response = plan.get("_raw_response")
+    plan_for_save = behavior_plan_for_save(plan)
+    if_then_plans = [
+        {
+            "task_id": task.get("task_id"),
+            "title": task.get("title"),
+            "if_then_plan": task.get("if_then_plan"),
+        }
+        for task in plan_for_save.get("top_tasks", [])
+    ]
+    return create_or_update_behavior_plan({
+        "plan_date": context["current_date"],
+        "source": "behavior_design",
+        "main_objective": plan_for_save.get("main_objective"),
+        "full_plan_json": plan_for_save.get("top_tasks"),
+        "minimum_viable_day_json": plan_for_save.get("minimum_viable_day"),
+        "if_then_plans_json": if_then_plans,
+        "woop_json": plan_for_save.get("woop"),
+        "avoidance_warning": plan_for_save.get("avoidance_warning"),
+        "planning_cap_minutes": plan_for_save.get("planning_cap_minutes"),
+        "output_json": plan_for_save,
+        "raw_response": raw_response,
+    })
+
+
+def render_behavior_task_card(task_plan, task_lookup, key_prefix):
+    task_id = task_plan.get("task_id")
+    existing_task = task_lookup.get(str(task_id)) if task_id else None
+
+    with st.container(border=True):
+        st.markdown(f"#### {display_value(task_plan.get('title'))}")
+        columns = st.columns(4)
+        columns[0].markdown(f"**Course**  \n{display_value(task_plan.get('course'))}")
+        columns[1].markdown(
+            f"**Energy**  \n{display_value(task_plan.get('energy_level'))}"
+        )
+        columns[2].markdown(
+            f"**Load**  \n{display_value(task_plan.get('cognitive_load'))}"
+        )
+        columns[3].markdown(
+            "**Avoidance**  \n"
+            f"{display_value(task_plan.get('avoidance_risk'))}"
+        )
+
+        if existing_task:
+            columns = st.columns(3)
+            columns[0].markdown(
+                f"**Status**  \n{display_value(existing_task.get('status'))}"
+            )
+            columns[1].markdown(
+                f"**Due**  \n{display_value(existing_task.get('due_at'))}"
+            )
+            columns[2].markdown(
+                f"**Urgency**  \n{display_value(existing_task.get('urgency_label'))}"
+            )
+
+        st.markdown(
+            f"**Why this matters**  \n"
+            f"{display_value(task_plan.get('why_this_matters'))}"
+        )
+        st.markdown(
+            "**First action under 5 min**  \n"
+            f"{display_value(task_plan.get('first_action_under_5_min'))}"
+        )
+        st.markdown(
+            "**First 25-minute block**  \n"
+            f"{display_value(task_plan.get('first_25_minute_block'))}"
+        )
+        st.markdown(
+            f"**Stop condition**  \n{display_value(task_plan.get('stop_condition'))}"
+        )
+        st.markdown(
+            f"**Likely obstacle**  \n{display_value(task_plan.get('likely_obstacle'))}"
+        )
+        if_then = task_plan.get("if_then_plan") or {}
+        st.markdown(
+            f"**If-then plan**  \nIf {display_value(if_then.get('if'))}, "
+            f"then {display_value(if_then.get('then'))}."
+        )
+
+        if task_id and existing_task:
+            if st.button(
+                "Apply Behavior Design to Task",
+                key=f"{key_prefix}-apply-behavior-{task_id}",
+            ):
+                update_task_behavior_fields(
+                    task_id,
+                    behavior_updates_for_task(task_plan),
+                )
+                st.success("Behavior fields applied to the task.")
+                st.rerun()
+        elif task_id:
+            st.warning("This task id was not found in the current task list.")
+
+
+def render_behavior_plan(plan, task_lookup, key_prefix="behavior-plan"):
+    if not plan:
+        st.info("No Behavior Design Plan to display yet.")
+        return
+
+    st.markdown("### Main Objective")
+    st.write(display_value(plan.get("main_objective")))
+
+    columns = st.columns(2)
+    columns[0].metric("Planning Cap", f"{plan.get('planning_cap_minutes') or '-'} min")
+    columns[1].metric("Mode", display_value(plan.get("mode")))
+
+    st.markdown("### Top Tasks")
+    top_tasks = plan.get("top_tasks") or []
+    if not top_tasks:
+        st.info("No behavior-designed tasks were returned.")
+    for index, task_plan in enumerate(top_tasks[:3], start=1):
+        render_behavior_task_card(
+            task_plan,
+            task_lookup,
+            key_prefix=f"{key_prefix}-{index}",
+        )
+
+    woop = plan.get("woop") or {}
+    st.markdown("### WOOP")
+    woop_columns = st.columns(2)
+    woop_columns[0].markdown(f"**Wish**  \n{display_value(woop.get('wish'))}")
+    woop_columns[1].markdown(f"**Outcome**  \n{display_value(woop.get('outcome'))}")
+    woop_columns = st.columns(2)
+    woop_columns[0].markdown(
+        f"**Obstacle**  \n{display_value(woop.get('obstacle'))}"
+    )
+    woop_columns[1].markdown(f"**Plan**  \n{display_value(woop.get('plan'))}")
+
+    minimum_day = plan.get("minimum_viable_day") or {}
+    st.markdown("### Minimum Viable Day")
+    required = minimum_day.get("required") or []
+    optional = minimum_day.get("optional") or []
+    if required:
+        st.markdown("**Required**")
+        for item in required:
+            st.markdown(f"- {display_value(item)}")
+    if optional:
+        st.markdown("**Optional**")
+        for item in optional:
+            st.markdown(f"- {display_value(item)}")
+    st.markdown(
+        "**Definition of success**  \n"
+        f"{display_value(minimum_day.get('definition_of_success'))}"
+    )
+
+    avoid_items = plan.get("do_not_do_today") or []
+    if avoid_items:
+        st.markdown("### Do Not Do Today")
+        for item in avoid_items:
+            st.markdown(f"- {display_value(item)}")
+
+    if plan.get("avoidance_warning"):
+        st.markdown("### Avoidance Warning")
+        st.warning(plan["avoidance_warning"])
+
+    st.markdown("### End-of-Day Review Question")
+    st.write(display_value(plan.get("end_of_day_review_question")))
+
+
+def render_behavior_memory_candidates(plan, key_prefix="behavior-memory"):
+    candidates = plan.get("memory_candidates") if plan else []
+    if not candidates:
+        return
+
+    st.markdown("### Memory Candidates")
+    st.caption("These are not saved automatically. Save only the ones you want.")
+    for index, candidate in enumerate(candidates, start=1):
+        with st.container(border=True):
+            st.markdown(
+                f"#### {display_value(candidate.get('memory_type'))}: "
+                f"{display_value(candidate.get('memory_key'))}"
+            )
+            st.markdown(display_value(candidate.get("memory_value")))
+            columns = st.columns(2)
+            columns[0].markdown(
+                f"**Confidence**  \n{display_value(candidate.get('confidence'))}"
+            )
+            columns[1].markdown(
+                f"**Source**  \n{display_value(candidate.get('source'))}"
+            )
+
+            memory_type = candidate.get("memory_type") or "other"
+            memory_key = candidate.get("memory_key")
+            if memory_key and memory_exists(memory_type, memory_key):
+                st.caption("This memory already exists.")
+                continue
+
+            columns = st.columns(2)
+            with columns[0]:
+                if st.button(
+                    "Save to Agent Memory",
+                    key=f"{key_prefix}-save-{index}",
+                ):
+                    create_agent_memory({
+                        "memory_type": candidate.get("memory_type"),
+                        "memory_key": candidate.get("memory_key"),
+                        "memory_value": candidate.get("memory_value"),
+                        "confidence": candidate.get("confidence") or "medium",
+                        "source": candidate.get("source") or "behavior_design",
+                        "is_active": 1,
+                    })
+                    st.success("Memory saved.")
+                    st.rerun()
+            with columns[1]:
+                if st.button("Ignore", key=f"{key_prefix}-ignore-{index}"):
+                    st.info("Ignored for this view. Nothing was saved.")
+
+
+def render_behavior_generate(
+    plan_date,
+    user_checkin_text,
+    key_prefix,
+    button_label="Generate Behavior Design Plan",
+):
+    key_present = has_behavior_design_api_key()
+    if not key_present:
+        st.warning("Add OPENAI_API_KEY to your .env file to use Behavior Design.")
+
+    if st.button(
+        button_label,
+        disabled=not key_present,
+        key=f"{key_prefix}-generate",
+    ):
+        context, _ = current_behavior_design_context(plan_date, user_checkin_text)
+        with st.spinner("Designing first actions..."):
+            try:
+                plan = generate_behavior_design_plan(context)
+                save_behavior_plan(plan, context)
+            except BehaviorDesignConfigError as error:
+                st.error(str(error))
+                return None
+            except BehaviorDesignResponseError as error:
+                st.error(str(error))
+                if error.raw_response:
+                    st.text_area(
+                        "Raw AI response",
+                        value=error.raw_response,
+                        height=240,
+                    )
+                return None
+            except Exception as error:
+                st.error(f"Could not generate Behavior Design Plan: {error}")
+                return None
+
+        st.success("Behavior Design Plan saved.")
+        return behavior_plan_for_save(plan)
+
+    return None
+
+
+def render_latest_behavior_plan(plan_date, task_lookup, key_prefix):
+    latest = get_behavior_plan_by_date(plan_date)
+    if not latest:
+        st.info("No Behavior Design Plan saved for this date yet.")
+        return None
+
+    st.caption(
+        f"Saved {display_datetime(latest['updated_at'])} for {latest['plan_date']}."
+    )
+    plan = parse_saved_behavior_plan(latest)
+    if not plan:
+        st.warning("The latest saved Behavior Design Plan could not be parsed.")
+        return None
+
+    render_behavior_plan(plan, task_lookup, key_prefix=key_prefix)
+    render_behavior_memory_candidates(plan, key_prefix=f"{key_prefix}-memory")
+    return plan
+
+
+def render_recent_behavior_plans():
+    st.markdown("### Recent Behavior Plans")
+    plans = get_recent_behavior_plans(limit=7)
+    if not plans:
+        st.info("No saved Behavior Design Plans yet.")
+        return
+
+    for record in plans:
+        plan = parse_saved_behavior_plan(record)
+        title = (
+            f"{record['plan_date']} - "
+            f"{display_datetime(record['updated_at'])}"
+        )
+        with st.expander(title):
+            if not plan:
+                st.warning("This saved behavior plan could not be parsed.")
+                continue
+            st.markdown(
+                f"**Objective**  \n{display_value(plan.get('main_objective'))}"
+            )
+            st.markdown(
+                "**Minimum viable day**  \n"
+                f"{display_value((plan.get('minimum_viable_day') or {}).get('definition_of_success'))}"
+            )
+
+
+def render_behavior_design():
+    st.subheader("Behavior Design")
+    st.info(
+        "Behavior Design turns the plan into easier starting behaviors: first "
+        "actions under 5 minutes, 25-minute blocks, if-then recovery plans, "
+        "WOOP obstacle planning, and a minimum viable day. It does not update "
+        "task status."
+    )
+
+    selected_date = st.date_input("Behavior plan date", value=date.today())
+    plan_date = selected_date.isoformat()
+    user_checkin_text = st.text_area(
+        "Tell the AI Boss your current state",
+        placeholder=(
+            "Example: I have 2 hours, low energy, gym at 6pm, and I am "
+            "avoiding STA457 because it feels unclear."
+        ),
+        height=120,
+    )
+
+    context, tasks = current_behavior_design_context(plan_date, user_checkin_text)
+    task_lookup = task_lookup_by_id(tasks)
+
+    st.markdown("### Status")
+    columns = st.columns(5)
+    columns[0].metric("Active Tasks", context["counts"]["active_tasks"])
+    columns[1].metric("Today Tasks", context["counts"]["today_relevant_tasks"])
+    columns[2].metric("Focus Sessions", context["counts"]["recent_focus_sessions"])
+    columns[3].metric("Reviews", context["counts"]["recent_daily_reviews"])
+    columns[4].metric("Avoidance Signals", context["counts"]["avoidance_signals"])
+
+    generated_plan = render_behavior_generate(
+        plan_date,
+        user_checkin_text,
+        key_prefix="behavior-page",
+    )
+    if generated_plan:
+        render_behavior_plan(
+            generated_plan,
+            task_lookup,
+            key_prefix="behavior-page-generated",
+        )
+        render_behavior_memory_candidates(
+            generated_plan,
+            key_prefix="behavior-page-generated-memory",
+        )
+
+    st.markdown("### Latest Behavior Plan")
+    render_latest_behavior_plan(plan_date, task_lookup, key_prefix="behavior-page-latest")
+    render_recent_behavior_plans()
 
 
 def compact_proposal_dict(values):
@@ -1257,6 +1690,29 @@ def render_command_center_quick_command(context, task_lookup):
     st.markdown("### Daily Command")
     render_daily_command_status(context)
     render_daily_command_generate(context, task_lookup)
+
+    st.markdown("### First Actions")
+    st.caption(
+        "Behavior Design turns the Daily Command into smaller starting "
+        "behaviors. It saves a plan, but it does not update tasks unless you "
+        "apply a task's behavior fields."
+    )
+    generated_plan = render_behavior_generate(
+        context["current_date"],
+        user_checkin_text=None,
+        key_prefix="command-center-behavior",
+        button_label="Design First Actions",
+    )
+    if generated_plan:
+        render_behavior_plan(
+            generated_plan,
+            task_lookup,
+            key_prefix="command-center-behavior-generated",
+        )
+        render_behavior_memory_candidates(
+            generated_plan,
+            key_prefix="command-center-behavior-memory",
+        )
 
 
 def render_command_center():
@@ -3023,6 +3479,8 @@ def render_advanced_choice(choice):
         render_command_center()
     elif choice == "Daily Command":
         render_daily_command()
+    elif choice == "Behavior Design":
+        render_behavior_design()
     elif choice == "Feedback Loop":
         render_feedback_loop()
     elif choice == "Today Plan":

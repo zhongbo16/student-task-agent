@@ -27,6 +27,14 @@ TASK_COLUMNS = (
     "auto_created",
     "needs_review",
     "last_scored_at",
+    "first_action",
+    "next_action",
+    "energy_level",
+    "cognitive_load",
+    "emotional_friction",
+    "avoidance_risk",
+    "behavior_prompt",
+    "last_behavior_designed_at",
     "created_at",
     "updated_at",
 )
@@ -54,6 +62,14 @@ class Task:
     auto_created: int = 0
     needs_review: int = 0
     last_scored_at: Optional[str] = None
+    first_action: Optional[str] = None
+    next_action: Optional[str] = None
+    energy_level: Optional[str] = None
+    cognitive_load: Optional[str] = None
+    emotional_friction: Optional[str] = None
+    avoidance_risk: Optional[str] = None
+    behavior_prompt: Optional[str] = None
+    last_behavior_designed_at: Optional[str] = None
 
 
 def _clean_text(value):

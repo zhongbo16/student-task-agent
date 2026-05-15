@@ -1,5 +1,6 @@
 import csv
 import hashlib
+import json
 import shutil
 import sqlite3
 from contextlib import closing
@@ -50,6 +51,10 @@ VALID_COMMITMENT_TYPES = (
     "other",
 )
 VALID_MEMORY_CANDIDATE_DECISIONS = ("pending", "accepted", "ignored", "duplicate")
+VALID_BEHAVIOR_ENERGY_LEVELS = ("low", "medium", "high")
+VALID_COGNITIVE_LOADS = ("shallow", "medium", "deep")
+VALID_BEHAVIOR_FRICTIONS = ("low", "medium", "high")
+VALID_AVOIDANCE_RISKS = ("low", "medium", "high", "unknown")
 
 
 def _connect():
@@ -61,6 +66,10 @@ def _connect():
 def _create_tasks_table(cursor, table_name="tasks"):
     allowed_statuses = "', '".join(VALID_STATUSES)
     allowed_urgency_labels = "', '".join(VALID_URGENCY_LABELS)
+    allowed_energy_levels = "', '".join(VALID_BEHAVIOR_ENERGY_LEVELS)
+    allowed_cognitive_loads = "', '".join(VALID_COGNITIVE_LOADS)
+    allowed_friction_levels = "', '".join(VALID_BEHAVIOR_FRICTIONS)
+    allowed_avoidance_risks = "', '".join(VALID_AVOIDANCE_RISKS)
     cursor.execute(f'''
         CREATE TABLE {table_name} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,6 +102,26 @@ def _create_tasks_table(cursor, table_name="tasks"):
             auto_created INTEGER DEFAULT 0 CHECK (auto_created IN (0, 1)),
             needs_review INTEGER DEFAULT 0 CHECK (needs_review IN (0, 1)),
             last_scored_at TEXT,
+            first_action TEXT,
+            next_action TEXT,
+            energy_level TEXT CHECK (
+                energy_level IS NULL
+                OR energy_level IN ('{allowed_energy_levels}')
+            ),
+            cognitive_load TEXT CHECK (
+                cognitive_load IS NULL
+                OR cognitive_load IN ('{allowed_cognitive_loads}')
+            ),
+            emotional_friction TEXT CHECK (
+                emotional_friction IS NULL
+                OR emotional_friction IN ('{allowed_friction_levels}')
+            ),
+            avoidance_risk TEXT CHECK (
+                avoidance_risk IS NULL
+                OR avoidance_risk IN ('{allowed_avoidance_risks}')
+            ),
+            behavior_prompt TEXT,
+            last_behavior_designed_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -181,6 +210,27 @@ def _create_ai_boss_briefings_table(cursor):
             output_json TEXT,
             raw_response TEXT,
             created_at TEXT
+        )
+    ''')
+
+
+def _create_behavior_plans_table(cursor):
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS behavior_plans (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            plan_date TEXT NOT NULL UNIQUE,
+            source TEXT,
+            main_objective TEXT,
+            full_plan_json TEXT,
+            minimum_viable_day_json TEXT,
+            if_then_plans_json TEXT,
+            woop_json TEXT,
+            avoidance_warning TEXT,
+            planning_cap_minutes INTEGER,
+            output_json TEXT,
+            raw_response TEXT,
+            created_at TEXT,
+            updated_at TEXT
         )
     ''')
 
@@ -449,6 +499,7 @@ def _database_needs_backup_before_init():
             "personal_commitments",
         )
         daily_commands_missing = not _table_exists(cursor, "daily_commands")
+        behavior_plans_missing = not _table_exists(cursor, "behavior_plans")
         daily_command_reviews_missing = not _table_exists(
             cursor,
             "daily_command_reviews",
@@ -472,6 +523,7 @@ def _database_needs_backup_before_init():
             or morning_checkins_missing
             or personal_commitments_missing
             or daily_commands_missing
+            or behavior_plans_missing
             or daily_command_reviews_missing
             or agent_memory_candidates_missing
             or checkin_answers_missing
@@ -568,13 +620,24 @@ def _migrate_tasks_table(cursor, existing_columns):
     if "needs_review" in legacy_columns:
         needs_review_expr = "CASE WHEN needs_review = 1 THEN 1 ELSE 0 END"
 
+    def choice_expr(column_name, valid_values):
+        if column_name not in legacy_columns:
+            return "NULL"
+        allowed = "', '".join(valid_values)
+        return (
+            f"CASE WHEN {column_name} IN ('{allowed}') "
+            f"THEN {column_name} ELSE NULL END"
+        )
+
     cursor.execute(f'''
         INSERT INTO tasks (
             id, title, course, task_type, due_at, planned_date,
             estimated_minutes, priority, status, source, confidence, notes,
             source_snippet, external_id, external_source, external_url,
             urgency_score, urgency_label, auto_created, needs_review,
-            last_scored_at,
+            last_scored_at, first_action, next_action, energy_level,
+            cognitive_load, emotional_friction, avoidance_risk,
+            behavior_prompt, last_behavior_designed_at,
             created_at, updated_at
         )
         SELECT
@@ -599,6 +662,14 @@ def _migrate_tasks_table(cursor, existing_columns):
             {auto_created_expr},
             {needs_review_expr},
             {text_expr("last_scored_at")},
+            {text_expr("first_action")},
+            {text_expr("next_action")},
+            {choice_expr("energy_level", VALID_BEHAVIOR_ENERGY_LEVELS)},
+            {choice_expr("cognitive_load", VALID_COGNITIVE_LOADS)},
+            {choice_expr("emotional_friction", VALID_BEHAVIOR_FRICTIONS)},
+            {choice_expr("avoidance_risk", VALID_AVOIDANCE_RISKS)},
+            {text_expr("behavior_prompt")},
+            {text_expr("last_behavior_designed_at")},
             {created_at_expr},
             {updated_at_expr}
         FROM tasks_legacy
@@ -611,7 +682,9 @@ TASK_SELECT = '''
            estimated_minutes, priority, status, source, confidence, notes,
            source_snippet, external_id, external_source, external_url,
            urgency_score, urgency_label, auto_created, needs_review,
-           last_scored_at,
+           last_scored_at, first_action, next_action, energy_level,
+           cognitive_load, emotional_friction, avoidance_risk,
+           behavior_prompt, last_behavior_designed_at,
            created_at, updated_at
     FROM tasks
 '''
@@ -662,6 +735,40 @@ def add_task_urgency_columns_if_missing(cursor=None):
         conn.commit()
 
 
+def add_task_behavior_columns_if_missing(cursor=None):
+    def add_columns(active_cursor):
+        columns = set(_table_columns(active_cursor, "tasks"))
+        if "first_action" not in columns:
+            active_cursor.execute("ALTER TABLE tasks ADD COLUMN first_action TEXT")
+        if "next_action" not in columns:
+            active_cursor.execute("ALTER TABLE tasks ADD COLUMN next_action TEXT")
+        if "energy_level" not in columns:
+            active_cursor.execute("ALTER TABLE tasks ADD COLUMN energy_level TEXT")
+        if "cognitive_load" not in columns:
+            active_cursor.execute("ALTER TABLE tasks ADD COLUMN cognitive_load TEXT")
+        if "emotional_friction" not in columns:
+            active_cursor.execute(
+                "ALTER TABLE tasks ADD COLUMN emotional_friction TEXT"
+            )
+        if "avoidance_risk" not in columns:
+            active_cursor.execute("ALTER TABLE tasks ADD COLUMN avoidance_risk TEXT")
+        if "behavior_prompt" not in columns:
+            active_cursor.execute("ALTER TABLE tasks ADD COLUMN behavior_prompt TEXT")
+        if "last_behavior_designed_at" not in columns:
+            active_cursor.execute(
+                "ALTER TABLE tasks ADD COLUMN last_behavior_designed_at TEXT"
+            )
+
+    if cursor is not None:
+        add_columns(cursor)
+        return
+
+    with closing(_connect()) as conn:
+        active_cursor = conn.cursor()
+        add_columns(active_cursor)
+        conn.commit()
+
+
 def init_db():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if _database_needs_backup_before_init():
@@ -674,12 +781,14 @@ def init_db():
         else:
             _migrate_tasks_table(cursor, _table_columns(cursor, "tasks"))
         add_task_urgency_columns_if_missing(cursor)
+        add_task_behavior_columns_if_missing(cursor)
         _create_study_sessions_table(cursor)
         _create_task_candidates_table(cursor)
         _create_course_archives_table(cursor)
         _create_morning_checkins_table(cursor)
         _create_personal_commitments_table(cursor)
         _create_daily_commands_table(cursor)
+        _create_behavior_plans_table(cursor)
         _create_daily_command_reviews_table(cursor)
         _create_agent_memory_candidates_table(cursor)
         _create_checkin_answers_table(cursor)
@@ -692,6 +801,7 @@ def init_db():
     init_morning_checkins_table(create_backup=False)
     init_personal_commitments_table(create_backup=False)
     init_daily_commands_table(create_backup=False)
+    init_behavior_plans_table(create_backup=False)
     init_daily_command_reviews_table(create_backup=False)
     init_agent_memory_candidates_table(create_backup=False)
     init_checkin_answers_table(create_backup=False)
@@ -818,6 +928,24 @@ def init_daily_commands_table(create_backup=True):
     with closing(_connect()) as conn:
         cursor = conn.cursor()
         _create_daily_commands_table(cursor)
+        conn.commit()
+
+
+def init_behavior_plans_table(create_backup=True):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    missing = True
+    if DB_PATH.exists():
+        with closing(_connect()) as conn:
+            cursor = conn.cursor()
+            missing = not _table_exists(cursor, "behavior_plans")
+
+    if missing and create_backup:
+        backup_database()
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        _create_behavior_plans_table(cursor)
         conn.commit()
 
 
@@ -2424,6 +2552,174 @@ def get_recent_ai_boss_briefings(limit=7):
             (limit,),
         )
         return [dict(row) for row in cursor.fetchall()]
+
+
+def _json_text(value):
+    if value in (None, ""):
+        return None
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False)
+    return str(value)
+
+
+def _clean_planning_cap(value):
+    if value in (None, ""):
+        return None
+    try:
+        cap = int(value)
+    except (TypeError, ValueError):
+        return None
+    return cap if cap >= 0 else None
+
+
+def create_or_update_behavior_plan(plan):
+    plan_date = _clean_review_date(plan.get("plan_date"))
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO behavior_plans (
+                plan_date, source, main_objective, full_plan_json,
+                minimum_viable_day_json, if_then_plans_json, woop_json,
+                avoidance_warning, planning_cap_minutes, output_json,
+                raw_response, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(plan_date) DO UPDATE SET
+                source = excluded.source,
+                main_objective = excluded.main_objective,
+                full_plan_json = excluded.full_plan_json,
+                minimum_viable_day_json = excluded.minimum_viable_day_json,
+                if_then_plans_json = excluded.if_then_plans_json,
+                woop_json = excluded.woop_json,
+                avoidance_warning = excluded.avoidance_warning,
+                planning_cap_minutes = excluded.planning_cap_minutes,
+                output_json = excluded.output_json,
+                raw_response = excluded.raw_response,
+                updated_at = excluded.updated_at
+            ''',
+            (
+                plan_date,
+                _clean_review_text(plan.get("source")) or "behavior_design",
+                _clean_review_text(plan.get("main_objective")),
+                _json_text(plan.get("full_plan_json")),
+                _json_text(plan.get("minimum_viable_day_json")),
+                _json_text(plan.get("if_then_plans_json")),
+                _json_text(plan.get("woop_json")),
+                _clean_review_text(plan.get("avoidance_warning")),
+                _clean_planning_cap(plan.get("planning_cap_minutes")),
+                _json_text(plan.get("output_json")),
+                _clean_review_text(plan.get("raw_response")),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+
+    return get_behavior_plan_by_date(plan_date)
+
+
+def get_behavior_plan_by_date(plan_date):
+    plan_date = _clean_review_date(plan_date)
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, plan_date, source, main_objective, full_plan_json,
+                   minimum_viable_day_json, if_then_plans_json, woop_json,
+                   avoidance_warning, planning_cap_minutes, output_json,
+                   raw_response, created_at, updated_at
+            FROM behavior_plans
+            WHERE plan_date = ?
+            LIMIT 1
+            ''',
+            (plan_date,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def get_recent_behavior_plans(limit=7):
+    limit = max(1, int(limit))
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, plan_date, source, main_objective, full_plan_json,
+                   minimum_viable_day_json, if_then_plans_json, woop_json,
+                   avoidance_warning, planning_cap_minutes, output_json,
+                   raw_response, created_at, updated_at
+            FROM behavior_plans
+            ORDER BY plan_date DESC, updated_at DESC, id DESC
+            LIMIT ?
+            ''',
+            (limit,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def update_task_behavior_fields(task_id, updates):
+    allowed_fields = {
+        "first_action",
+        "next_action",
+        "energy_level",
+        "cognitive_load",
+        "emotional_friction",
+        "avoidance_risk",
+        "behavior_prompt",
+        "last_behavior_designed_at",
+    }
+    safe_updates = {
+        key: value for key, value in (updates or {}).items()
+        if key in allowed_fields
+    }
+    if not safe_updates:
+        return 0
+
+    cleaned_updates = {}
+    text_fields = {"first_action", "next_action", "behavior_prompt"}
+    for field in text_fields:
+        if field in safe_updates:
+            cleaned_updates[field] = _clean_review_text(safe_updates[field])
+
+    choice_fields = {
+        "energy_level": (VALID_BEHAVIOR_ENERGY_LEVELS, "Energy level"),
+        "cognitive_load": (VALID_COGNITIVE_LOADS, "Cognitive load"),
+        "emotional_friction": (VALID_BEHAVIOR_FRICTIONS, "Emotional friction"),
+        "avoidance_risk": (VALID_AVOIDANCE_RISKS, "Avoidance risk"),
+    }
+    for field, (valid_values, field_name) in choice_fields.items():
+        if field in safe_updates:
+            cleaned_updates[field] = _normalize_choice(
+                safe_updates[field],
+                valid_values,
+                default=None,
+                field_name=field_name,
+            )
+
+    now = datetime.now().isoformat(timespec="seconds")
+    cleaned_updates["last_behavior_designed_at"] = (
+        _clean_review_text(safe_updates.get("last_behavior_designed_at")) or now
+    )
+    cleaned_updates["updated_at"] = now
+
+    assignments = ", ".join(f"{field} = ?" for field in cleaned_updates)
+    values = [cleaned_updates[field] for field in cleaned_updates]
+    values.append(int(task_id))
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f'''
+            UPDATE tasks
+            SET {assignments}
+            WHERE id = ?
+            ''',
+            tuple(values),
+        )
+        conn.commit()
+        return cursor.rowcount
 
 
 def update_task_urgency(task_id, urgency_score, urgency_label):
