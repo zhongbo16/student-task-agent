@@ -130,6 +130,7 @@ ADVANCED_MENU_OPTIONS = [
     "Tasks",
     "Today",
     "This Week",
+    "7-Day Timeline",
     "Today Plan",
     "Daily Command",
     "Behavior Design",
@@ -453,6 +454,35 @@ def inject_calm_command_css():
             line-height: 1.1;
             margin: 0.2rem 0 1rem;
         }
+
+        .timeline-day {
+            color: var(--text-main);
+            font-size: 0.96rem;
+            font-weight: 750;
+            margin: 0.25rem 0 0.4rem;
+        }
+
+        .timeline-item {
+            border-left: 3px solid var(--border);
+            padding: 0.35rem 0 0.35rem 0.75rem;
+            margin: 0.35rem 0;
+        }
+
+        .timeline-item-critical,
+        .timeline-item-urgent {
+            border-left-color: var(--critical);
+        }
+
+        .timeline-item-soon,
+        .timeline-item-normal {
+            border-left-color: var(--warning);
+        }
+
+        .timeline-title {
+            color: var(--text-main);
+            font-weight: 700;
+            line-height: 1.35;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -499,6 +529,85 @@ def first_action_for_task(task):
     if task.get("next_action"):
         return task["next_action"]
     return "Open this task and write the exact next step."
+
+
+def parse_timeline_date(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def timeline_day_label(day, today=None):
+    today = today or date.today()
+    if day == today:
+        prefix = "Today"
+    elif day == today + timedelta(days=1):
+        prefix = "Tomorrow"
+    else:
+        prefix = day.strftime("%a")
+    return f"{prefix} | {day.isoformat()}"
+
+
+def timeline_entry_sort_key(entry):
+    task = entry["task"]
+    score, _, _ = calculate_urgency_score(task)
+    kind_rank = 0 if entry["kind"] == "due" else 1
+    return (
+        -score,
+        kind_rank,
+        task.get("due_at") or task.get("planned_date") or "9999-12-31",
+        -(int(task.get("priority") or 0)),
+        task.get("title") or "",
+    )
+
+
+def build_7_day_timeline(tasks=None, today=None):
+    today = today or date.today()
+    tasks = tasks if tasks is not None else get_all_tasks()
+    active_tasks = [
+        task for task in tasks
+        if task.get("status") not in ("done", "ignored")
+    ]
+
+    overdue = []
+    day_entries = {
+        today + timedelta(days=offset): []
+        for offset in range(7)
+    }
+    for task in active_tasks:
+        due_date = parse_timeline_date(task.get("due_at"))
+        planned_date = parse_timeline_date(task.get("planned_date"))
+        if due_date and due_date < today:
+            overdue.append({"task": task, "kind": "overdue"})
+
+        seen = set()
+        for kind, task_date in (("due", due_date), ("planned", planned_date)):
+            if task_date not in day_entries:
+                continue
+            key = (task.get("id"), kind, task_date)
+            if key in seen:
+                continue
+            seen.add(key)
+            day_entries[task_date].append({"task": task, "kind": kind})
+
+    return {
+        "overdue": sorted(overdue, key=timeline_entry_sort_key),
+        "days": [
+            {
+                "date": day,
+                "label": timeline_day_label(day, today),
+                "entries": sorted(entries, key=timeline_entry_sort_key),
+            }
+            for day, entries in day_entries.items()
+        ],
+    }
 
 
 def display_date(task):
@@ -1797,6 +1906,85 @@ def render_minimum_viable_day(behavior_plan):
             st.caption(f"Success: {definition}")
 
 
+def render_timeline_entry(entry, compact=False, key_prefix="timeline"):
+    task = entry["task"]
+    urgency_score, urgency_label = task_urgency(task)
+    badge = urgency_badge_html(urgency_label)
+    kind = entry.get("kind") or "task"
+    css_label = re.sub(r"[^a-z0-9_]+", "_", str(urgency_label).lower())
+
+    st.markdown(
+        (
+            f'<div class="timeline-item timeline-item-{css_label}">'
+            '<div class="task-title-row">'
+            f'<div class="timeline-title">{escape_html(task.get("title"))}</div>'
+            f'{badge}'
+            '</div>'
+            f'<div class="task-card-meta">{escape_html(kind.title())} | '
+            f'{escape_html(task_meta_line(task))}</div>'
+            f'<div class="calm-first-action">{escape_html(first_action_for_task(task))}</div>'
+            '</div>'
+        ),
+        unsafe_allow_html=True,
+    )
+
+    if not compact:
+        with st.expander("Details"):
+            st.caption(f"Urgency score: {urgency_score:.1f}")
+            render_task_fields(task)
+
+
+def render_7_day_timeline(compact=False):
+    timeline = build_7_day_timeline()
+    overdue = timeline["overdue"]
+
+    if compact:
+        with st.expander("Next 7 Days", expanded=False):
+            rendered = False
+            if overdue:
+                rendered = True
+                st.warning(f"{len(overdue)} overdue task(s) need attention.")
+                for entry in overdue[:2]:
+                    render_timeline_entry(entry, compact=True)
+                if len(overdue) > 2:
+                    st.caption(f"+ {len(overdue) - 2} more overdue task(s).")
+
+            for day in timeline["days"]:
+                entries = day["entries"]
+                if not entries:
+                    continue
+                rendered = True
+                st.markdown(f'<div class="timeline-day">{day["label"]}</div>', unsafe_allow_html=True)
+                for entry in entries[:3]:
+                    render_timeline_entry(entry, compact=True)
+                if len(entries) > 3:
+                    st.caption(f"+ {len(entries) - 3} more.")
+            if not rendered:
+                st.caption("No active tasks due or planned in the next 7 days.")
+        return
+
+    st.subheader("7-Day Academic Timeline")
+    st.info(
+        "This is not a month calendar. It only shows overdue work and the next "
+        "7 days so deadlines can influence today's execution plan."
+    )
+    if overdue:
+        st.markdown("### Overdue")
+        for entry in overdue:
+            render_timeline_entry(entry, key_prefix="timeline-overdue")
+
+    for day in timeline["days"]:
+        st.markdown(f"### {day['label']}")
+        if not day["entries"]:
+            st.caption("No due or planned tasks.")
+            continue
+        for entry in day["entries"]:
+            render_timeline_entry(
+                entry,
+                key_prefix=f"timeline-{day['date'].isoformat()}",
+            )
+
+
 def planning_cap_from_tasks(top_tasks):
     labels = [task_urgency(task)[1] for task in top_tasks]
     if "critical" in labels:
@@ -1920,6 +2108,8 @@ def render_command_center_top_tasks(tasks):
             with st.expander("Details"):
                 st.caption(f"Urgency score: {urgency_score:.1f}")
                 render_task_fields(task)
+
+    render_7_day_timeline(compact=True)
 
     with st.expander("Daily Command and First Action Tools", expanded=False):
         if command:
@@ -3994,6 +4184,8 @@ def render_advanced_choice(choice):
         render_memory_workspace()
     elif choice == "Daily Command":
         render_daily_command()
+    elif choice == "7-Day Timeline":
+        render_7_day_timeline()
     elif choice == "Behavior Design":
         render_behavior_design()
     elif choice == "Feedback Loop":
