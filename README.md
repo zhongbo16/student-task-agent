@@ -37,6 +37,10 @@ The app currently supports manual task tracking, syllabus PDF upload, AI-assiste
   - One review per date
   - Update existing reviews instead of creating duplicates
   - Export daily reviews to CSV
+- Persistent Agent Memory
+  - Manually store long-term preferences, rules, goals, and patterns
+  - Deactivate memories without deleting raw data
+  - Seed default AI Boss foundation memories without duplicates
 - Data retention foundation
   - SQLite backups before schema migrations when practical
   - Raw data preserved for future agent memory
@@ -116,5 +120,6 @@ Main persisted data:
 - `tasks`
 - `study_sessions`
 - `daily_reviews`
+- `agent_memory`
 
 Future AI memory should summarize patterns from raw data without overwriting raw data.

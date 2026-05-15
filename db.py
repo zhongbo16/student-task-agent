@@ -14,6 +14,20 @@ BACKUP_DIR = DATA_DIR / "backups"
 EXPORT_DIR = DATA_DIR / "exports"
 VALID_COMPLETION_STATUSES = ("completed", "partial", "not_completed", "blocked")
 VALID_MOOD_ENERGY = ("low", "medium", "high")
+VALID_MEMORY_TYPES = (
+    "preference",
+    "pattern",
+    "weakness",
+    "strength",
+    "rule",
+    "goal",
+    "course_context",
+    "time_estimation",
+    "avoidance",
+    "management_style",
+    "other",
+)
+VALID_MEMORY_CONFIDENCES = ("high", "medium", "low")
 
 
 def _connect():
@@ -104,6 +118,29 @@ def _create_daily_reviews_table(cursor):
     ''')
 
 
+def _create_agent_memory_table(cursor):
+    allowed_types = "', '".join(VALID_MEMORY_TYPES)
+    allowed_confidences = "', '".join(VALID_MEMORY_CONFIDENCES)
+    cursor.execute(f'''
+        CREATE TABLE IF NOT EXISTS agent_memory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            memory_type TEXT NOT NULL CHECK (
+                memory_type IN ('{allowed_types}')
+            ),
+            memory_key TEXT NOT NULL,
+            memory_value TEXT NOT NULL,
+            confidence TEXT CHECK (
+                confidence IS NULL
+                OR confidence IN ('{allowed_confidences}')
+            ),
+            source TEXT,
+            is_active INTEGER DEFAULT 1 CHECK (is_active IN (0, 1)),
+            created_at TEXT,
+            updated_at TEXT
+        )
+    ''')
+
+
 def _table_columns(cursor, table_name):
     cursor.execute(f"PRAGMA table_info({table_name})")
     return [row["name"] for row in cursor.fetchall()]
@@ -149,7 +186,8 @@ def _database_needs_backup_before_init():
             )
         )
         daily_reviews_missing = not _table_exists(cursor, "daily_reviews")
-        return tasks_need_migration or daily_reviews_missing
+        agent_memory_missing = not _table_exists(cursor, "agent_memory")
+        return tasks_need_migration or daily_reviews_missing or agent_memory_missing
 
 
 def _migrate_tasks_table(cursor, existing_columns):
@@ -287,6 +325,7 @@ def init_db():
         conn.commit()
 
     init_daily_reviews_table(create_backup=False)
+    init_agent_memory_table(create_backup=False)
 
 
 def backup_database():
@@ -315,6 +354,24 @@ def init_daily_reviews_table(create_backup=True):
     with closing(_connect()) as conn:
         cursor = conn.cursor()
         _create_daily_reviews_table(cursor)
+        conn.commit()
+
+
+def init_agent_memory_table(create_backup=True):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    agent_memory_missing = True
+    if DB_PATH.exists():
+        with closing(_connect()) as conn:
+            cursor = conn.cursor()
+            agent_memory_missing = not _table_exists(cursor, "agent_memory")
+
+    if agent_memory_missing and create_backup:
+        backup_database()
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        _create_agent_memory_table(cursor)
         conn.commit()
 
 
@@ -796,6 +853,219 @@ def export_daily_reviews_to_csv(output_path):
         writer.writerows(reviews)
 
     return str(output_path)
+
+
+def _clean_memory_text(value):
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    return text or None
+
+
+def _clean_memory_type(value):
+    memory_type = _clean_memory_text(value)
+    if not memory_type:
+        raise ValueError("Memory type is required.")
+
+    memory_type = memory_type.lower()
+    if memory_type not in VALID_MEMORY_TYPES:
+        raise ValueError(
+            f"Memory type must be one of: {', '.join(VALID_MEMORY_TYPES)}."
+        )
+    return memory_type
+
+
+def _clean_memory_confidence(value):
+    confidence = _clean_memory_text(value)
+    if not confidence:
+        return None
+
+    confidence = confidence.lower()
+    if confidence not in VALID_MEMORY_CONFIDENCES:
+        raise ValueError(
+            "Confidence must be one of: "
+            f"{', '.join(VALID_MEMORY_CONFIDENCES)}."
+        )
+    return confidence
+
+
+def _clean_is_active(value):
+    if value in (None, ""):
+        return 1
+
+    return 1 if int(value) else 0
+
+
+def _normalize_agent_memory(memory):
+    memory_key = _clean_memory_text(memory.get("memory_key"))
+    if not memory_key:
+        raise ValueError("Memory key is required.")
+
+    memory_value = _clean_memory_text(memory.get("memory_value"))
+    if not memory_value:
+        raise ValueError("Memory value is required.")
+
+    return {
+        "memory_type": _clean_memory_type(memory.get("memory_type")),
+        "memory_key": memory_key,
+        "memory_value": memory_value,
+        "confidence": _clean_memory_confidence(memory.get("confidence")),
+        "source": _clean_memory_text(memory.get("source")) or "manual",
+        "is_active": _clean_is_active(memory.get("is_active", 1)),
+    }
+
+
+def _fetch_agent_memories(where_clause="", params=()):
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f'''
+            SELECT id, memory_type, memory_key, memory_value, confidence,
+                   source, is_active, created_at, updated_at
+            FROM agent_memory
+            {where_clause}
+            ''',
+            params,
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def create_agent_memory(memory):
+    memory = _normalize_agent_memory(memory)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO agent_memory (
+                memory_type, memory_key, memory_value, confidence,
+                source, is_active, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                memory["memory_type"],
+                memory["memory_key"],
+                memory["memory_value"],
+                memory["confidence"],
+                memory["source"],
+                memory["is_active"],
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_active_agent_memory():
+    return _fetch_agent_memories(
+        '''
+        WHERE is_active = 1
+        ORDER BY memory_type ASC, updated_at DESC, id DESC
+        '''
+    )
+
+
+def get_agent_memory_by_type(memory_type):
+    memory_type = _clean_memory_type(memory_type)
+    return _fetch_agent_memories(
+        '''
+        WHERE is_active = 1 AND memory_type = ?
+        ORDER BY updated_at DESC, id DESC
+        ''',
+        (memory_type,),
+    )
+
+
+def update_agent_memory(memory_id, updates):
+    allowed_fields = {
+        "memory_type",
+        "memory_key",
+        "memory_value",
+        "confidence",
+        "source",
+        "is_active",
+    }
+    safe_updates = {
+        key: value for key, value in updates.items()
+        if key in allowed_fields
+    }
+    if not safe_updates:
+        return None
+
+    current = _fetch_agent_memories("WHERE id = ? LIMIT 1", (memory_id,))
+    if not current:
+        return None
+
+    merged = dict(current[0])
+    merged.update(safe_updates)
+    normalized = _normalize_agent_memory(merged)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            UPDATE agent_memory
+            SET memory_type = ?,
+                memory_key = ?,
+                memory_value = ?,
+                confidence = ?,
+                source = ?,
+                is_active = ?,
+                updated_at = ?
+            WHERE id = ?
+            ''',
+            (
+                normalized["memory_type"],
+                normalized["memory_key"],
+                normalized["memory_value"],
+                normalized["confidence"],
+                normalized["source"],
+                normalized["is_active"],
+                now,
+                memory_id,
+            ),
+        )
+        conn.commit()
+
+    result = _fetch_agent_memories("WHERE id = ? LIMIT 1", (memory_id,))
+    return result[0] if result else None
+
+
+def deactivate_agent_memory(memory_id):
+    return update_agent_memory(memory_id, {"is_active": 0})
+
+
+def delete_agent_memory(memory_id):
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM agent_memory WHERE id = ?", (memory_id,))
+        conn.commit()
+
+
+def memory_exists(memory_type, memory_key):
+    memory_type = _clean_memory_type(memory_type)
+    memory_key = _clean_memory_text(memory_key)
+    if not memory_key:
+        return False
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT 1
+            FROM agent_memory
+            WHERE is_active = 1
+              AND memory_type = ?
+              AND memory_key = ?
+            LIMIT 1
+            ''',
+            (memory_type, memory_key),
+        )
+        return cursor.fetchone() is not None
 
 
 def delete_task(task_id):

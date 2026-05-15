@@ -14,14 +14,18 @@ from canvas_client import (
 )
 from db import (
     complete_study_session,
+    create_agent_memory,
     create_or_update_daily_review,
     create_task,
     create_canvas_assignment_task,
     create_study_session_start,
+    deactivate_agent_memory,
     export_daily_reviews_to_csv,
     get_active_study_session,
+    get_active_agent_memory,
     get_all_tasks,
     get_daily_review_by_date,
+    memory_exists,
     get_recent_study_sessions,
     get_recent_daily_reviews,
     get_tasks_by_status,
@@ -41,6 +45,7 @@ MENU_OPTIONS = [
     "Today Plan",
     "Focus Session",
     "Daily Review",
+    "Agent Memory",
     "Today",
     "This Week",
     "Confirmed Tasks",
@@ -70,6 +75,92 @@ STATUS_ACTIONS = {
         ("Reopen", "confirmed"),
     ],
 }
+
+MEMORY_TYPES = [
+    "preference",
+    "pattern",
+    "weakness",
+    "strength",
+    "rule",
+    "goal",
+    "course_context",
+    "time_estimation",
+    "avoidance",
+    "management_style",
+    "other",
+]
+
+MEMORY_SOURCES = [
+    "manual",
+    "study_sessions",
+    "daily_reviews",
+    "ai_summary_later",
+    "system",
+]
+
+DEFAULT_AGENT_MEMORIES = [
+    {
+        "memory_type": "management_style",
+        "memory_key": "preferred_boss_style",
+        "memory_value": (
+            "User wants a direct AI boss style: clear instructions, some "
+            "pressure, but not insulting."
+        ),
+        "confidence": "high",
+        "source": "manual",
+    },
+    {
+        "memory_type": "rule",
+        "memory_key": "no_deadline_invention",
+        "memory_value": (
+            "The agent must never invent deadlines. If a deadline is unclear, "
+            "ask for confirmation or mark confidence low."
+        ),
+        "confidence": "high",
+        "source": "system",
+    },
+    {
+        "memory_type": "rule",
+        "memory_key": "suggested_tasks_need_confirmation",
+        "memory_value": (
+            "AI-extracted tasks should remain suggested until the user "
+            "confirms them."
+        ),
+        "confidence": "high",
+        "source": "system",
+    },
+    {
+        "memory_type": "rule",
+        "memory_key": "top_three_tasks",
+        "memory_value": (
+            "The agent should usually recommend at most three main tasks per "
+            "day to avoid overwhelm."
+        ),
+        "confidence": "high",
+        "source": "system",
+    },
+    {
+        "memory_type": "rule",
+        "memory_key": "ai_suggests_user_confirms",
+        "memory_value": (
+            "AI can suggest actions and priorities, but the user should "
+            "confirm uncertain tasks before they become official commitments."
+        ),
+        "confidence": "high",
+        "source": "system",
+    },
+    {
+        "memory_type": "goal",
+        "memory_key": "build_ai_execution_manager",
+        "memory_value": (
+            "The long-term product goal is to build an AI execution manager "
+            "that helps the user plan, execute, review, and improve work "
+            "habits over time."
+        ),
+        "confidence": "high",
+        "source": "manual",
+    },
+]
 
 
 def display_value(value):
@@ -831,6 +922,109 @@ def render_daily_review():
     render_recent_daily_reviews()
 
 
+def render_agent_memory_info():
+    st.info(
+        "Agent Memory stores long-term patterns, preferences, goals, and "
+        "rules. Raw data remains in tasks, focus sessions, and daily reviews. "
+        "Future AI Boss features can use both raw data and active memories, "
+        "but this page does not call AI or generate memories automatically."
+    )
+
+
+def render_add_agent_memory():
+    st.markdown("### Add Memory")
+    with st.form("agent_memory_form"):
+        memory_type = st.selectbox("Memory type", options=MEMORY_TYPES)
+        memory_key = st.text_input("Memory key")
+        memory_value = st.text_area("Memory value")
+        confidence = st.selectbox(
+            "Confidence",
+            options=["high", "medium", "low"],
+            index=1,
+        )
+        source = st.selectbox("Source", options=MEMORY_SOURCES)
+        submitted = st.form_submit_button("Save Memory")
+
+    if submitted:
+        try:
+            create_agent_memory({
+                "memory_type": memory_type,
+                "memory_key": memory_key,
+                "memory_value": memory_value,
+                "confidence": confidence,
+                "source": source,
+                "is_active": 1,
+            })
+        except ValueError as error:
+            st.error(str(error))
+        else:
+            st.success("Agent memory saved.")
+            st.rerun()
+
+
+def render_active_agent_memory():
+    st.markdown("### Active Memories")
+    memories = get_active_agent_memory()
+    if not memories:
+        st.info("No active agent memories yet.")
+        return
+
+    for memory in memories:
+        with st.container(border=True):
+            st.markdown(
+                f"#### {display_value(memory['memory_type'])}: "
+                f"{display_value(memory['memory_key'])}"
+            )
+            st.markdown(display_value(memory["memory_value"]))
+
+            columns = st.columns(3)
+            columns[0].markdown(
+                f"**Confidence**  \n{display_value(memory['confidence'])}"
+            )
+            columns[1].markdown(f"**Source**  \n{display_value(memory['source'])}")
+            columns[2].markdown(
+                f"**Updated**  \n{display_datetime(memory['updated_at'])}"
+            )
+
+            if st.button("Deactivate", key=f"deactivate-memory-{memory['id']}"):
+                deactivate_agent_memory(memory["id"])
+                st.success("Agent memory deactivated.")
+                st.rerun()
+
+
+def seed_default_agent_memories():
+    created_count = 0
+    skipped_count = 0
+    for memory in DEFAULT_AGENT_MEMORIES:
+        if memory_exists(memory["memory_type"], memory["memory_key"]):
+            skipped_count += 1
+            continue
+
+        create_agent_memory(memory)
+        created_count += 1
+
+    return created_count, skipped_count
+
+
+def render_seed_agent_memory():
+    st.markdown("### Seed Default AI Boss Memories")
+    if st.button("Seed Default AI Boss Memories"):
+        created_count, skipped_count = seed_default_agent_memories()
+        st.success(
+            f"Created {created_count} default memories. "
+            f"Skipped {skipped_count} existing memories."
+        )
+        st.rerun()
+
+
+def render_agent_memory():
+    st.subheader("Agent Memory")
+    render_agent_memory_info()
+    render_add_agent_memory()
+    render_active_agent_memory()
+    render_seed_agent_memory()
+
+
 def main():
     st.title("Student Task Manager")
 
@@ -845,6 +1039,8 @@ def main():
         render_focus_session()
     elif choice == "Daily Review":
         render_daily_review()
+    elif choice == "Agent Memory":
+        render_agent_memory()
     elif choice == "Files / Syllabus Upload":
         render_file_upload()
     elif choice == "Quercus Sync":
