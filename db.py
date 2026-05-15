@@ -8,6 +8,7 @@ from models import TASK_COLUMNS, VALID_STATUSES, normalize_task
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "tasks.db"
+VALID_COMPLETION_STATUSES = ("completed", "partial", "not_completed", "blocked")
 
 
 def _connect():
@@ -44,6 +45,33 @@ def _create_tasks_table(cursor, table_name="tasks"):
             external_url TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
+        )
+    ''')
+
+
+def _create_study_sessions_table(cursor):
+    allowed_statuses = "', '".join(VALID_COMPLETION_STATUSES)
+    cursor.execute(f'''
+        CREATE TABLE IF NOT EXISTS study_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER,
+            task_title TEXT,
+            course TEXT,
+            start_time TEXT,
+            end_time TEXT,
+            planned_minutes INTEGER CHECK (
+                planned_minutes IS NULL OR planned_minutes > 0
+            ),
+            actual_minutes INTEGER CHECK (
+                actual_minutes IS NULL OR actual_minutes >= 0
+            ),
+            completion_status TEXT CHECK (
+                completion_status IS NULL
+                OR completion_status IN ('{allowed_statuses}')
+            ),
+            blocker TEXT,
+            notes TEXT,
+            created_at TEXT
         )
     ''')
 
@@ -207,6 +235,7 @@ def init_db():
             _create_tasks_table(cursor)
         else:
             _migrate_tasks_table(cursor, _table_columns(cursor, "tasks"))
+        _create_study_sessions_table(cursor)
         conn.commit()
 
 
@@ -367,6 +396,162 @@ def create_canvas_assignment_task(assignment):
         "external_url": external_url,
     })
     return True
+
+
+def _fetch_study_session(where_clause="", params=()):
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f'''
+            SELECT id, task_id, task_title, course, start_time, end_time,
+                   planned_minutes, actual_minutes, completion_status,
+                   blocker, notes, created_at
+            FROM study_sessions
+            {where_clause}
+            ''',
+            params,
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def _fetch_study_sessions(where_clause="", params=()):
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f'''
+            SELECT id, task_id, task_title, course, start_time, end_time,
+                   planned_minutes, actual_minutes, completion_status,
+                   blocker, notes, created_at
+            FROM study_sessions
+            {where_clause}
+            ''',
+            params,
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_active_study_session():
+    return _fetch_study_session(
+        "WHERE end_time IS NULL ORDER BY start_time DESC LIMIT 1"
+    )
+
+
+def create_study_session_start(task_id, task_title, course, planned_minutes):
+    planned_minutes = int(planned_minutes)
+    if planned_minutes <= 0:
+        raise ValueError("Planned minutes must be greater than 0.")
+
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute("BEGIN IMMEDIATE")
+        cursor.execute(
+            '''
+            SELECT id
+            FROM study_sessions
+            WHERE end_time IS NULL
+            LIMIT 1
+            '''
+        )
+        if cursor.fetchone() is not None:
+            raise ValueError("A focus session is already active.")
+
+        cursor.execute(
+            '''
+            INSERT INTO study_sessions (
+                task_id, task_title, course, start_time, end_time,
+                planned_minutes, actual_minutes, completion_status,
+                blocker, notes, created_at
+            ) VALUES (?, ?, ?, ?, NULL, ?, NULL, NULL, NULL, NULL, ?)
+            ''',
+            (
+                task_id,
+                task_title,
+                course,
+                now,
+                planned_minutes,
+                now,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def _actual_minutes(start_time, end_time):
+    try:
+        start = datetime.fromisoformat(start_time)
+        end = datetime.fromisoformat(end_time)
+    except (TypeError, ValueError):
+        return None
+
+    elapsed_seconds = max(0, int((end - start).total_seconds()))
+    return elapsed_seconds // 60
+
+
+def complete_study_session(session_id, completion_status, blocker, notes):
+    if completion_status not in VALID_COMPLETION_STATUSES:
+        raise ValueError(
+            "Completion status must be one of: "
+            f"{', '.join(VALID_COMPLETION_STATUSES)}"
+        )
+
+    session = _fetch_study_session(
+        "WHERE id = ? AND end_time IS NULL LIMIT 1",
+        (session_id,),
+    )
+    if session is None:
+        raise ValueError("No active focus session was found for this session id.")
+
+    end_time = datetime.now().isoformat(timespec="seconds")
+    actual_minutes = _actual_minutes(session["start_time"], end_time)
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            UPDATE study_sessions
+            SET end_time = ?,
+                actual_minutes = ?,
+                completion_status = ?,
+                blocker = ?,
+                notes = ?
+            WHERE id = ? AND end_time IS NULL
+            ''',
+            (
+                end_time,
+                actual_minutes,
+                completion_status,
+                blocker,
+                notes,
+                session_id,
+            ),
+        )
+        conn.commit()
+
+    return _fetch_study_session("WHERE id = ? LIMIT 1", (session_id,))
+
+
+def get_recent_study_sessions(limit=20):
+    limit = max(1, int(limit))
+    return _fetch_study_sessions(
+        '''
+        ORDER BY created_at DESC, id DESC
+        LIMIT ?
+        ''',
+        (limit,),
+    )
+
+
+def get_study_sessions_for_task(task_id):
+    return _fetch_study_sessions(
+        '''
+        WHERE task_id = ?
+        ORDER BY created_at DESC, id DESC
+        ''',
+        (task_id,),
+    )
 
 
 def delete_task(task_id):

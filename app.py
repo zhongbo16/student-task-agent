@@ -1,5 +1,6 @@
 import hashlib
 import re
+from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
@@ -12,9 +13,13 @@ from canvas_client import (
     has_canvas_base_url,
 )
 from db import (
+    complete_study_session,
     create_task,
     create_canvas_assignment_task,
+    create_study_session_start,
+    get_active_study_session,
     get_all_tasks,
+    get_recent_study_sessions,
     get_tasks_by_status,
     get_this_week_tasks,
     get_today_tasks,
@@ -29,6 +34,7 @@ UPLOAD_DIR = BASE_DIR / "uploads"
 
 MENU_OPTIONS = [
     "Today Plan",
+    "Focus Session",
     "Today",
     "This Week",
     "Confirmed Tasks",
@@ -72,6 +78,31 @@ def display_date(task):
     if task.get("planned_date"):
         return f"Planned: {task['planned_date']}"
     return "No date"
+
+
+def display_datetime(value):
+    if not value:
+        return "-"
+
+    try:
+        parsed = datetime.fromisoformat(str(value))
+    except ValueError:
+        return str(value)
+
+    return parsed.strftime("%Y-%m-%d %H:%M")
+
+
+def elapsed_minutes_since(value):
+    if not value:
+        return 0
+
+    try:
+        start_time = datetime.fromisoformat(str(value))
+    except ValueError:
+        return 0
+
+    elapsed_seconds = max(0, int((datetime.now() - start_time).total_seconds()))
+    return elapsed_seconds // 60
 
 
 def safe_filename(filename):
@@ -171,6 +202,46 @@ def render_status_actions(task, current_view):
                 st.rerun()
 
 
+def can_focus_task(task):
+    return task.get("status") not in ("done", "ignored")
+
+
+def start_focus_session_for_task(task, planned_minutes=25):
+    session_id = create_study_session_start(
+        task["id"],
+        task["title"],
+        task.get("course"),
+        planned_minutes,
+    )
+    if task.get("status") != "in_progress":
+        update_task_status(task["id"], "in_progress")
+    return session_id
+
+
+def render_focus_action(task, current_view):
+    if not can_focus_task(task):
+        return
+
+    active_session = get_active_study_session()
+    if active_session:
+        st.caption("A focus session is already active.")
+        return
+
+    if st.button(
+        "Start Focus",
+        key=f"{view_key(current_view)}-{task['id']}-start-focus",
+    ):
+        try:
+            start_focus_session_for_task(task)
+        except ValueError as error:
+            st.error(str(error))
+        else:
+            st.session_state.status_update_message = (
+                f"Started a focus session for '{task['title']}'."
+            )
+            st.rerun()
+
+
 def render_task_cards(tasks, current_view):
     if not tasks:
         st.info(empty_message_for_view(current_view))
@@ -184,6 +255,7 @@ def render_task_cards(tasks, current_view):
                 st.caption(" | ".join(f"[{indicator}]" for indicator in indicators))
             render_task_fields(task)
             render_status_actions(task, current_view)
+            render_focus_action(task, current_view)
 
 
 def render_add_task_form():
@@ -430,6 +502,144 @@ def render_quercus_sync():
             st.success("Quercus/Canvas assignment sync finished.")
 
 
+def task_option_label(task):
+    course = task.get("course") or "No course"
+    status = task.get("status") or "-"
+    return f"{task['title']} | {course} | {status}"
+
+
+def active_tasks():
+    return [
+        task for task in get_all_tasks()
+        if task.get("status") not in ("done", "ignored")
+    ]
+
+
+def render_session_summary(session):
+    st.markdown(f"**Task:** {display_value(session['task_title'])}")
+    st.markdown(f"**Course:** {display_value(session['course'])}")
+    st.markdown(f"**Started:** {display_datetime(session['start_time'])}")
+    st.markdown(f"**Planned:** {display_value(session['planned_minutes'])} min")
+    st.markdown(f"**Elapsed:** about {elapsed_minutes_since(session['start_time'])} min")
+
+
+def render_start_focus_session():
+    tasks = active_tasks()
+    if not tasks:
+        st.info("No active tasks are available for a focus session.")
+        return
+
+    task_lookup = {task["id"]: task for task in tasks}
+    selected_task_id = st.selectbox(
+        "Task",
+        options=list(task_lookup.keys()),
+        format_func=lambda task_id: task_option_label(task_lookup[task_id]),
+    )
+    planned_minutes = st.number_input(
+        "Planned minutes",
+        min_value=1,
+        value=25,
+        step=5,
+    )
+
+    if st.button("Start Focus Session"):
+        task = task_lookup[selected_task_id]
+        try:
+            start_focus_session_for_task(task, planned_minutes)
+        except ValueError as error:
+            st.error(str(error))
+        else:
+            st.success("Focus session started.")
+            st.rerun()
+
+
+def render_end_focus_session(active_session):
+    render_session_summary(active_session)
+
+    with st.form("end_focus_session_form"):
+        completion_status = st.selectbox(
+            "Completion status",
+            options=["completed", "partial", "not_completed", "blocked"],
+        )
+        blocker = st.text_input("Blocker")
+        notes = st.text_area("Notes")
+        mark_done = False
+        if completion_status == "completed":
+            mark_done = st.checkbox("Mark task as done", value=True)
+
+        submitted = st.form_submit_button("End Session")
+
+    if submitted:
+        try:
+            completed_session = complete_study_session(
+                active_session["id"],
+                completion_status,
+                blocker,
+                notes,
+            )
+            task_id = active_session.get("task_id")
+            if task_id and completion_status == "completed" and mark_done:
+                update_task_status(task_id, "done")
+            elif task_id and completion_status in (
+                "partial",
+                "not_completed",
+                "blocked",
+            ):
+                update_task_status(task_id, "in_progress")
+        except ValueError as error:
+            st.error(str(error))
+        else:
+            st.success(
+                "Focus session ended. "
+                f"Actual time: {display_value(completed_session['actual_minutes'])} min."
+            )
+            st.rerun()
+
+
+def render_recent_study_sessions():
+    st.markdown("### Recent Sessions")
+    sessions = get_recent_study_sessions(limit=20)
+    if not sessions:
+        st.info("No study sessions logged yet.")
+        return
+
+    for session in sessions:
+        with st.container(border=True):
+            st.markdown(f"**{display_value(session['task_title'])}**")
+            columns = st.columns(4)
+            columns[0].markdown(f"**Course**  \n{display_value(session['course'])}")
+            columns[1].markdown(
+                f"**Actual**  \n{display_value(session['actual_minutes'])} min"
+            )
+            columns[2].markdown(
+                "**Status**  \n"
+                f"{display_value(session['completion_status'])}"
+            )
+            columns[3].markdown(
+                f"**Created**  \n{display_datetime(session['created_at'])}"
+            )
+
+            columns = st.columns(2)
+            columns[0].markdown(
+                f"**Blocker**  \n{display_value(session['blocker'])}"
+            )
+            columns[1].markdown(f"**Notes**  \n{display_value(session['notes'])}")
+
+
+def render_focus_session():
+    st.subheader("Focus Session")
+    active_session = get_active_study_session()
+
+    if active_session:
+        st.markdown("### Active Session")
+        render_end_focus_session(active_session)
+    else:
+        st.markdown("### Start Session")
+        render_start_focus_session()
+
+    render_recent_study_sessions()
+
+
 def main():
     st.title("Student Task Manager")
 
@@ -440,6 +650,8 @@ def main():
 
     if choice == "Today Plan":
         render_today_plan()
+    elif choice == "Focus Session":
+        render_focus_session()
     elif choice == "Files / Syllabus Upload":
         render_file_upload()
     elif choice == "Quercus Sync":
