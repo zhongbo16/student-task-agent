@@ -1,6 +1,6 @@
 import sqlite3
 from contextlib import closing
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from models import TASK_COLUMNS, VALID_STATUSES, normalize_task
@@ -17,6 +17,7 @@ def _connect():
 
 
 def _create_tasks_table(cursor, table_name="tasks"):
+    allowed_statuses = "', '".join(VALID_STATUSES)
     cursor.execute(f'''
         CREATE TABLE {table_name} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -29,8 +30,8 @@ def _create_tasks_table(cursor, table_name="tasks"):
                 estimated_minutes IS NULL OR estimated_minutes > 0
             ),
             priority INTEGER NOT NULL DEFAULT 3 CHECK (priority BETWEEN 1 AND 5),
-            status TEXT NOT NULL DEFAULT 'todo' CHECK (
-                status IN ('todo', 'in_progress', 'done')
+            status TEXT NOT NULL DEFAULT 'confirmed' CHECK (
+                status IN ('{allowed_statuses}')
             ),
             notes TEXT,
             created_at TEXT NOT NULL,
@@ -52,9 +53,26 @@ def _table_exists(cursor, table_name):
     return cursor.fetchone() is not None
 
 
+def _table_sql(cursor, table_name):
+    cursor.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (table_name,),
+    )
+    row = cursor.fetchone()
+    return row["sql"] if row else ""
+
+
+def _status_schema_is_current(cursor):
+    sql = _table_sql(cursor, "tasks")
+    return (
+        "DEFAULT 'confirmed'" in sql
+        and all(f"'{status}'" in sql for status in VALID_STATUSES)
+    )
+
+
 def _migrate_tasks_table(cursor, existing_columns):
     expected_columns = list(TASK_COLUMNS)
-    if existing_columns == expected_columns:
+    if existing_columns == expected_columns and _status_schema_is_current(cursor):
         return
 
     legacy_columns = set(existing_columns)
@@ -68,11 +86,14 @@ def _migrate_tasks_table(cursor, existing_columns):
             return f"NULLIF(TRIM({column_name}), '')"
         return "NULL"
 
-    status_expr = "'todo'"
+    status_expr = "'confirmed'"
     if "status" in legacy_columns:
         allowed = "', '".join(VALID_STATUSES)
         status_expr = (
-            f"CASE WHEN status IN ('{allowed}') THEN status ELSE 'todo' END"
+            f"CASE "
+            f"WHEN status = 'todo' THEN 'confirmed' "
+            f"WHEN status IN ('{allowed}') THEN status "
+            f"ELSE 'confirmed' END"
         )
 
     priority_expr = "3"
@@ -126,6 +147,28 @@ def _migrate_tasks_table(cursor, existing_columns):
     cursor.execute("DROP TABLE tasks_legacy")
 
 
+TASK_SELECT = '''
+    SELECT id, title, course, task_type, due_at, planned_date,
+           estimated_minutes, priority, status, notes, created_at, updated_at
+    FROM tasks
+'''
+
+TASK_ORDER_BY = '''
+    ORDER BY
+        CASE WHEN due_at IS NULL THEN 1 ELSE 0 END,
+        due_at ASC,
+        priority DESC,
+        created_at DESC
+'''
+
+
+def _fetch_tasks(where_clause="", params=()):
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(f"{TASK_SELECT} {where_clause} {TASK_ORDER_BY}", params)
+        return [dict(row) for row in cursor.fetchall()]
+
+
 def init_db():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -167,19 +210,46 @@ def create_task(task):
 
 
 def get_all_tasks():
-    with closing(_connect()) as conn:
-        cursor = conn.cursor()
-        cursor.execute('''
-            SELECT id, title, course, task_type, due_at, planned_date,
-                   estimated_minutes, priority, status, notes, created_at, updated_at
-            FROM tasks
-            ORDER BY
-                CASE WHEN due_at IS NULL THEN 1 ELSE 0 END,
-                due_at ASC,
-                priority DESC,
-                created_at DESC
-        ''')
-        return [dict(row) for row in cursor.fetchall()]
+    return _fetch_tasks()
+
+
+def get_tasks_by_status(status):
+    if status not in VALID_STATUSES:
+        raise ValueError(f"Status must be one of: {', '.join(VALID_STATUSES)}")
+
+    return _fetch_tasks("WHERE status = ?", (status,))
+
+
+def get_today_tasks():
+    today = date.today().isoformat()
+    return _fetch_tasks(
+        '''
+        WHERE status NOT IN ('done', 'ignored')
+          AND (
+              due_at = ?
+              OR planned_date = ?
+              OR (due_at IS NOT NULL AND due_at < ?)
+          )
+        ''',
+        (today, today, today),
+    )
+
+
+def get_this_week_tasks():
+    today = date.today()
+    start_date = today.isoformat()
+    end_date = (today + timedelta(days=7)).isoformat()
+
+    return _fetch_tasks(
+        '''
+        WHERE status NOT IN ('done', 'ignored')
+          AND (
+              (due_at IS NOT NULL AND due_at BETWEEN ? AND ?)
+              OR (planned_date IS NOT NULL AND planned_date BETWEEN ? AND ?)
+          )
+        ''',
+        (start_date, end_date, start_date, end_date),
+    )
 
 
 def update_task_status(task_id, status):

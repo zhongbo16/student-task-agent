@@ -2,7 +2,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
 
-VALID_STATUSES = ("todo", "in_progress", "done")
+VALID_STATUSES = ("suggested", "confirmed", "ignored", "in_progress", "done")
 
 TASK_COLUMNS = (
     "id",
@@ -29,7 +29,7 @@ class Task:
     planned_date: Optional[str] = None
     estimated_minutes: Optional[int] = None
     priority: int = 3
-    status: str = "todo"
+    status: str = "confirmed"
     notes: Optional[str] = None
 
 
@@ -73,7 +73,7 @@ def normalize_task(task):
         if estimated_minutes <= 0:
             raise ValueError("Estimated minutes must be greater than 0.")
 
-    status = _clean_text(task.get("status")) or "todo"
+    status = _clean_text(task.get("status")) or "confirmed"
     if status not in VALID_STATUSES:
         raise ValueError(f"Status must be one of: {', '.join(VALID_STATUSES)}.")
 
