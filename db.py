@@ -1,3 +1,5 @@
+import csv
+import shutil
 import sqlite3
 from contextlib import closing
 from datetime import date, datetime, timedelta
@@ -8,7 +10,10 @@ from models import TASK_COLUMNS, VALID_STATUSES, normalize_task
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
 DB_PATH = DATA_DIR / "tasks.db"
+BACKUP_DIR = DATA_DIR / "backups"
+EXPORT_DIR = DATA_DIR / "exports"
 VALID_COMPLETION_STATUSES = ("completed", "partial", "not_completed", "blocked")
+VALID_MOOD_ENERGY = ("low", "medium", "high")
 
 
 def _connect():
@@ -76,6 +81,29 @@ def _create_study_sessions_table(cursor):
     ''')
 
 
+def _create_daily_reviews_table(cursor):
+    allowed_moods = "', '".join(VALID_MOOD_ENERGY)
+    cursor.execute(f'''
+        CREATE TABLE IF NOT EXISTS daily_reviews (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            review_date TEXT NOT NULL UNIQUE,
+            completed_summary TEXT,
+            missed_tasks TEXT,
+            blockers TEXT,
+            avoidance_notes TEXT,
+            tomorrow_top_priority TEXT,
+            mood_energy TEXT CHECK (
+                mood_energy IS NULL OR mood_energy IN ('{allowed_moods}')
+            ),
+            focus_rating INTEGER CHECK (
+                focus_rating IS NULL OR focus_rating BETWEEN 1 AND 5
+            ),
+            created_at TEXT,
+            updated_at TEXT
+        )
+    ''')
+
+
 def _table_columns(cursor, table_name):
     cursor.execute(f"PRAGMA table_info({table_name})")
     return [row["name"] for row in cursor.fetchall()]
@@ -104,6 +132,24 @@ def _status_schema_is_current(cursor):
         "DEFAULT 'confirmed'" in sql
         and all(f"'{status}'" in sql for status in VALID_STATUSES)
     )
+
+
+def _database_needs_backup_before_init():
+    if not DB_PATH.exists():
+        return False
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        tasks_exists = _table_exists(cursor, "tasks")
+        tasks_need_migration = (
+            tasks_exists
+            and (
+                _table_columns(cursor, "tasks") != list(TASK_COLUMNS)
+                or not _status_schema_is_current(cursor)
+            )
+        )
+        daily_reviews_missing = not _table_exists(cursor, "daily_reviews")
+        return tasks_need_migration or daily_reviews_missing
 
 
 def _migrate_tasks_table(cursor, existing_columns):
@@ -228,6 +274,8 @@ def _fetch_tasks(where_clause="", params=()):
 
 def init_db():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if _database_needs_backup_before_init():
+        backup_database()
 
     with closing(_connect()) as conn:
         cursor = conn.cursor()
@@ -236,6 +284,37 @@ def init_db():
         else:
             _migrate_tasks_table(cursor, _table_columns(cursor, "tasks"))
         _create_study_sessions_table(cursor)
+        conn.commit()
+
+    init_daily_reviews_table(create_backup=False)
+
+
+def backup_database():
+    if not DB_PATH.exists():
+        return None
+
+    BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_path = BACKUP_DIR / f"tasks_backup_{timestamp}.db"
+    shutil.copy2(DB_PATH, backup_path)
+    return str(backup_path)
+
+
+def init_daily_reviews_table(create_backup=True):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    daily_reviews_missing = True
+    if DB_PATH.exists():
+        with closing(_connect()) as conn:
+            cursor = conn.cursor()
+            daily_reviews_missing = not _table_exists(cursor, "daily_reviews")
+
+    if daily_reviews_missing and create_backup:
+        backup_database()
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        _create_daily_reviews_table(cursor)
         conn.commit()
 
 
@@ -552,6 +631,171 @@ def get_study_sessions_for_task(task_id):
         ''',
         (task_id,),
     )
+
+
+def _clean_review_text(value):
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    return text or None
+
+
+def _clean_review_date(value):
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+
+    if isinstance(value, date):
+        return value.isoformat()
+
+    text = str(value).strip()
+    datetime.strptime(text, "%Y-%m-%d")
+    return text
+
+
+def _clean_focus_rating(value):
+    if value in (None, ""):
+        return None
+
+    rating = int(value)
+    if rating < 1 or rating > 5:
+        raise ValueError("Focus rating must be between 1 and 5.")
+    return rating
+
+
+def _normalize_daily_review(review):
+    review_date = _clean_review_date(review.get("review_date"))
+    mood_energy = _clean_review_text(review.get("mood_energy"))
+    if mood_energy:
+        mood_energy = mood_energy.lower()
+        if mood_energy not in VALID_MOOD_ENERGY:
+            raise ValueError(
+                f"Mood / energy must be one of: {', '.join(VALID_MOOD_ENERGY)}."
+            )
+
+    return {
+        "review_date": review_date,
+        "completed_summary": _clean_review_text(review.get("completed_summary")),
+        "missed_tasks": _clean_review_text(review.get("missed_tasks")),
+        "blockers": _clean_review_text(review.get("blockers")),
+        "avoidance_notes": _clean_review_text(review.get("avoidance_notes")),
+        "tomorrow_top_priority": _clean_review_text(
+            review.get("tomorrow_top_priority")
+        ),
+        "mood_energy": mood_energy,
+        "focus_rating": _clean_focus_rating(review.get("focus_rating")),
+    }
+
+
+def create_or_update_daily_review(review):
+    review = _normalize_daily_review(review)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO daily_reviews (
+                review_date, completed_summary, missed_tasks, blockers,
+                avoidance_notes, tomorrow_top_priority, mood_energy,
+                focus_rating, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(review_date) DO UPDATE SET
+                completed_summary = excluded.completed_summary,
+                missed_tasks = excluded.missed_tasks,
+                blockers = excluded.blockers,
+                avoidance_notes = excluded.avoidance_notes,
+                tomorrow_top_priority = excluded.tomorrow_top_priority,
+                mood_energy = excluded.mood_energy,
+                focus_rating = excluded.focus_rating,
+                updated_at = excluded.updated_at
+            ''',
+            (
+                review["review_date"],
+                review["completed_summary"],
+                review["missed_tasks"],
+                review["blockers"],
+                review["avoidance_notes"],
+                review["tomorrow_top_priority"],
+                review["mood_energy"],
+                review["focus_rating"],
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+
+    return get_daily_review_by_date(review["review_date"])
+
+
+def get_daily_review_by_date(review_date):
+    review_date = _clean_review_date(review_date)
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, review_date, completed_summary, missed_tasks, blockers,
+                   avoidance_notes, tomorrow_top_priority, mood_energy,
+                   focus_rating, created_at, updated_at
+            FROM daily_reviews
+            WHERE review_date = ?
+            LIMIT 1
+            ''',
+            (review_date,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def get_recent_daily_reviews(limit=14):
+    limit = max(1, int(limit))
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, review_date, completed_summary, missed_tasks, blockers,
+                   avoidance_notes, tomorrow_top_priority, mood_energy,
+                   focus_rating, created_at, updated_at
+            FROM daily_reviews
+            ORDER BY review_date DESC, updated_at DESC
+            LIMIT ?
+            ''',
+            (limit,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def delete_daily_review(review_id):
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM daily_reviews WHERE id = ?", (review_id,))
+        conn.commit()
+
+
+def export_daily_reviews_to_csv(output_path):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    reviews = get_recent_daily_reviews(limit=10_000)
+    fieldnames = [
+        "id",
+        "review_date",
+        "completed_summary",
+        "missed_tasks",
+        "blockers",
+        "avoidance_notes",
+        "tomorrow_top_priority",
+        "mood_energy",
+        "focus_rating",
+        "created_at",
+        "updated_at",
+    ]
+
+    with output_path.open("w", newline="", encoding="utf-8") as csv_file:
+        writer = csv.DictWriter(csv_file, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(reviews)
+
+    return str(output_path)
 
 
 def delete_task(task_id):

@@ -1,6 +1,6 @@
 import hashlib
 import re
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 import streamlit as st
@@ -14,12 +14,16 @@ from canvas_client import (
 )
 from db import (
     complete_study_session,
+    create_or_update_daily_review,
     create_task,
     create_canvas_assignment_task,
     create_study_session_start,
+    export_daily_reviews_to_csv,
     get_active_study_session,
     get_all_tasks,
+    get_daily_review_by_date,
     get_recent_study_sessions,
+    get_recent_daily_reviews,
     get_tasks_by_status,
     get_this_week_tasks,
     get_today_tasks,
@@ -31,10 +35,12 @@ from planner import generate_today_plan, sort_tasks_for_dashboard, task_indicato
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
+EXPORT_DIR = BASE_DIR / "data" / "exports"
 
 MENU_OPTIONS = [
     "Today Plan",
     "Focus Session",
+    "Daily Review",
     "Today",
     "This Week",
     "Confirmed Tasks",
@@ -640,6 +646,191 @@ def render_focus_session():
     render_recent_study_sessions()
 
 
+def today_task_summary():
+    today = date.today().isoformat()
+    tasks = get_all_tasks()
+    completed_today = [
+        task for task in tasks
+        if task.get("status") == "done"
+        and str(task.get("updated_at") or "").startswith(today)
+    ]
+    in_progress = [
+        task for task in tasks
+        if task.get("status") == "in_progress"
+    ]
+    overdue = [
+        task for task in tasks
+        if task.get("status") not in ("done", "ignored")
+        and task.get("due_at")
+        and task["due_at"] < today
+    ]
+    recent_focus_today = [
+        session for session in get_recent_study_sessions(limit=20)
+        if str(session.get("created_at") or "").startswith(today)
+    ]
+
+    return {
+        "completed_today": len(completed_today),
+        "in_progress": len(in_progress),
+        "overdue": len(overdue),
+        "active_session": get_active_study_session(),
+        "focus_sessions_today": len(recent_focus_today),
+    }
+
+
+def render_today_task_summary():
+    summary = today_task_summary()
+    st.markdown("### Today's Task Summary")
+    columns = st.columns(4)
+    columns[0].metric("Completed Today", summary["completed_today"])
+    columns[1].metric("In Progress", summary["in_progress"])
+    columns[2].metric("Overdue", summary["overdue"])
+    columns[3].metric("Focus Sessions", summary["focus_sessions_today"])
+
+    if summary["active_session"]:
+        st.info(
+            "A focus session is currently active for "
+            f"{summary['active_session']['task_title']}."
+        )
+
+
+def review_text_value(review, key):
+    if not review:
+        return ""
+    return review.get(key) or ""
+
+
+def review_mood_index(review):
+    moods = ["low", "medium", "high"]
+    if not review or review.get("mood_energy") not in moods:
+        return 1
+    return moods.index(review["mood_energy"])
+
+
+def render_daily_review_form():
+    st.markdown("### Today's Review")
+    selected_date = st.date_input("Review date", value=date.today())
+    review_date = selected_date.isoformat()
+    existing_review = get_daily_review_by_date(review_date)
+
+    if existing_review:
+        st.caption("A review already exists for this date. Saving will update it.")
+
+    with st.form("daily_review_form"):
+        completed_summary = st.text_area(
+            "What did you complete today?",
+            value=review_text_value(existing_review, "completed_summary"),
+        )
+        missed_tasks = st.text_area(
+            "What did you miss or postpone?",
+            value=review_text_value(existing_review, "missed_tasks"),
+        )
+        blockers = st.text_area(
+            "What blocked you?",
+            value=review_text_value(existing_review, "blockers"),
+        )
+        avoidance_notes = st.text_area(
+            "Did you avoid anything important?",
+            value=review_text_value(existing_review, "avoidance_notes"),
+        )
+        tomorrow_top_priority = st.text_input(
+            "What is tomorrow's top priority?",
+            value=review_text_value(existing_review, "tomorrow_top_priority"),
+        )
+        mood_energy = st.selectbox(
+            "Mood / energy",
+            options=["low", "medium", "high"],
+            index=review_mood_index(existing_review),
+        )
+        focus_rating = st.slider(
+            "Focus rating",
+            min_value=1,
+            max_value=5,
+            value=existing_review.get("focus_rating") or 3
+            if existing_review else 3,
+        )
+        submitted = st.form_submit_button("Save Daily Review")
+
+    if submitted:
+        try:
+            create_or_update_daily_review({
+                "review_date": review_date,
+                "completed_summary": completed_summary,
+                "missed_tasks": missed_tasks,
+                "blockers": blockers,
+                "avoidance_notes": avoidance_notes,
+                "tomorrow_top_priority": tomorrow_top_priority,
+                "mood_energy": mood_energy,
+                "focus_rating": focus_rating,
+            })
+        except ValueError as error:
+            st.error(str(error))
+        else:
+            st.success("Daily review saved.")
+
+
+def render_recent_daily_reviews():
+    st.markdown("### Recent Reviews")
+    reviews = get_recent_daily_reviews(limit=14)
+    if not reviews:
+        st.info("No daily reviews saved yet.")
+        return
+
+    for review in reviews:
+        with st.container(border=True):
+            st.markdown(f"#### {display_value(review['review_date'])}")
+            columns = st.columns(2)
+            columns[0].markdown(
+                "**Completed**  \n"
+                f"{display_value(review['completed_summary'])}"
+            )
+            columns[1].markdown(
+                "**Missed / Postponed**  \n"
+                f"{display_value(review['missed_tasks'])}"
+            )
+
+            columns = st.columns(2)
+            columns[0].markdown(
+                f"**Blockers**  \n{display_value(review['blockers'])}"
+            )
+            columns[1].markdown(
+                "**Avoidance Notes**  \n"
+                f"{display_value(review['avoidance_notes'])}"
+            )
+
+            columns = st.columns(3)
+            columns[0].markdown(
+                "**Tomorrow Priority**  \n"
+                f"{display_value(review['tomorrow_top_priority'])}"
+            )
+            columns[1].markdown(
+                f"**Mood / Energy**  \n{display_value(review['mood_energy'])}"
+            )
+            columns[2].markdown(
+                f"**Focus Rating**  \n{display_value(review['focus_rating'])}"
+            )
+
+
+def render_daily_review_export():
+    if st.button("Export Daily Reviews CSV"):
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_path = EXPORT_DIR / f"daily_reviews_{timestamp}.csv"
+        try:
+            exported_path = export_daily_reviews_to_csv(output_path)
+        except Exception as error:
+            st.error(f"Could not export daily reviews: {error}")
+        else:
+            st.success(f"Exported daily reviews to {exported_path}")
+
+
+def render_daily_review():
+    st.subheader("Daily Review")
+    render_today_task_summary()
+    render_daily_review_form()
+    render_daily_review_export()
+    render_recent_daily_reviews()
+
+
 def main():
     st.title("Student Task Manager")
 
@@ -652,6 +843,8 @@ def main():
         render_today_plan()
     elif choice == "Focus Session":
         render_focus_session()
+    elif choice == "Daily Review":
+        render_daily_review()
     elif choice == "Files / Syllabus Upload":
         render_file_upload()
     elif choice == "Quercus Sync":
