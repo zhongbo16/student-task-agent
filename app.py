@@ -6,6 +6,7 @@ from pathlib import Path
 
 import streamlit as st
 
+from action_engine import build_confirmable_actions, count_ready_actions
 from ai_boss import (
     AIBossConfigError,
     AIBossResponseError,
@@ -844,43 +845,51 @@ def proposal_has_content(proposal):
     ])
 
 
-def apply_conversation_proposal(command_date, proposal):
-    result = {
-        "morning_checkin_updated": False,
-        "personal_commitments_created": 0,
-        "daily_review_updated": False,
-        "memory_candidates_created": 0,
-        "memory_candidates_skipped": 0,
-    }
+def apply_confirmable_action(action):
+    action_type = action.get("action_type")
+    payload = action.get("payload") or {}
 
-    morning_updates = compact_proposal_dict(
-        proposal.get("morning_checkin_updates") or {}
-    )
-    if morning_updates:
-        merge_checkin_with_updates(command_date, morning_updates)
-        result["morning_checkin_updated"] = True
+    if action.get("status") != "ready":
+        return "skipped"
 
-    for commitment in proposal.get("personal_commitments") or []:
+    if action_type == "update_morning_checkin":
+        merge_checkin_with_updates(
+            payload.get("command_date"),
+            payload.get("updates") or {},
+        )
+        return "applied"
+
+    if action_type == "create_personal_commitment":
+        commitment = payload.get("commitment") or {}
         create_personal_commitment({
             "title": commitment.get("title"),
             "commitment_type": commitment.get("commitment_type") or "other",
-            "planned_date": commitment.get("planned_date") or command_date,
+            "planned_date": commitment.get("planned_date") or payload.get("command_date"),
             "start_time": commitment.get("start_time"),
             "estimated_minutes": commitment.get("estimated_minutes"),
             "priority": commitment.get("priority") or 3,
             "status": "planned",
             "notes": commitment.get("notes"),
         })
-        result["personal_commitments_created"] += 1
+        return "applied"
 
-    daily_review_update = compact_proposal_dict(
-        proposal.get("daily_review_update") or {}
-    )
-    if daily_review_update:
-        merge_daily_review_with_update(command_date, daily_review_update)
-        result["daily_review_updated"] = True
+    if action_type == "update_daily_review":
+        merge_daily_review_with_update(
+            payload.get("command_date"),
+            payload.get("updates") or {},
+        )
+        return "applied"
 
-    for candidate in proposal.get("memory_candidates") or []:
+    if action_type == "update_task_status":
+        task_id = payload.get("task_id")
+        suggested_status = payload.get("suggested_status")
+        if not task_id or not suggested_status:
+            return "skipped"
+        update_task_status(task_id, suggested_status)
+        return "applied"
+
+    if action_type == "create_memory_candidate":
+        candidate = payload.get("candidate") or {}
         candidate_id = create_agent_memory_candidate({
             "memory_type": candidate.get("memory_type"),
             "memory_key": candidate.get("memory_key"),
@@ -890,16 +899,100 @@ def apply_conversation_proposal(command_date, proposal):
             "evidence_json": json.dumps({
                 "source": "command_center",
                 "evidence": candidate.get("evidence"),
-                "command_date": command_date,
+                "command_date": payload.get("command_date"),
             }, ensure_ascii=False),
             "decision_status": "pending",
         })
-        if candidate_id:
-            result["memory_candidates_created"] += 1
-        else:
-            result["memory_candidates_skipped"] += 1
+        return "applied" if candidate_id else "duplicate"
 
+    return "skipped"
+
+
+def apply_selected_actions(actions, selected_action_ids):
+    selected_action_ids = set(selected_action_ids)
+    result = {
+        "applied": 0,
+        "skipped": 0,
+        "duplicates": 0,
+    }
+    for action in actions:
+        if action["id"] not in selected_action_ids:
+            continue
+        status = apply_confirmable_action(action)
+        if status == "applied":
+            result["applied"] += 1
+        elif status == "duplicate":
+            result["duplicates"] += 1
+        else:
+            result["skipped"] += 1
     return result
+
+
+def render_action_payload_preview(action):
+    payload = action.get("payload") or {}
+    action_type = action.get("action_type")
+
+    if action_type == "update_morning_checkin":
+        for key, value in (payload.get("updates") or {}).items():
+            st.markdown(f"- **{key}:** {display_value(value)}")
+    elif action_type == "create_personal_commitment":
+        commitment = payload.get("commitment") or {}
+        for key in ("title", "commitment_type", "planned_date", "start_time", "estimated_minutes"):
+            st.markdown(f"- **{key}:** {display_value(commitment.get(key))}")
+    elif action_type == "update_daily_review":
+        for key, value in (payload.get("updates") or {}).items():
+            st.markdown(f"- **{key}:** {display_value(value)}")
+    elif action_type == "update_task_status":
+        st.markdown(
+            f"- **Task:** {display_value(payload.get('resolved_task_title') or payload.get('suggestion', {}).get('title'))}"
+        )
+        st.markdown(f"- **New status:** {display_value(payload.get('suggested_status'))}")
+    elif action_type == "create_memory_candidate":
+        candidate = payload.get("candidate") or {}
+        st.markdown(f"- **Type:** {display_value(candidate.get('memory_type'))}")
+        st.markdown(f"- **Key:** {display_value(candidate.get('memory_key'))}")
+        st.markdown(f"- **Value:** {display_value(candidate.get('memory_value'))}")
+
+
+def render_confirmable_actions(command_date, proposal):
+    actions = build_confirmable_actions(proposal, command_date, get_all_tasks())
+    st.markdown("### Confirmable Actions")
+    if not actions:
+        st.info("No database actions were proposed. Answer any clarification questions above.")
+        return actions, []
+
+    ready_count = count_ready_actions(actions)
+    st.caption(
+        f"{ready_count} action(s) are ready to apply. "
+        "Actions that need attention are shown but disabled."
+    )
+
+    selected_action_ids = []
+    with st.form("confirmable_actions_form"):
+        for action in actions:
+            ready = action.get("status") == "ready"
+            with st.container(border=True):
+                selected = st.checkbox(
+                    action["label"],
+                    value=ready,
+                    disabled=not ready,
+                    key=f"action-select-{action['id']}",
+                )
+                if selected and ready:
+                    selected_action_ids.append(action["id"])
+
+                if action.get("reason"):
+                    st.caption(action["reason"])
+                if not ready:
+                    st.warning("Needs attention before it can be applied.")
+                render_action_payload_preview(action)
+
+        submitted = st.form_submit_button(
+            "Apply Selected Actions",
+            disabled=ready_count == 0,
+        )
+
+    return actions, selected_action_ids if submitted else None
 
 
 def proposal_field_rows(values):
@@ -1102,35 +1195,35 @@ def render_command_center_conversation(command_date, context):
     proposal = st.session_state.get("command_center_proposal")
     if proposal:
         render_conversation_proposal(proposal)
-        columns = st.columns(2)
-        with columns[0]:
-            if st.button(
-                "Apply Proposal",
-                disabled=not proposal_has_content(proposal),
-            ):
+        actions, selected_action_ids = render_confirmable_actions(
+            command_date,
+            proposal,
+        )
+        if selected_action_ids is not None:
+            if not selected_action_ids:
+                st.info("No actions were selected.")
+            else:
                 try:
-                    result = apply_conversation_proposal(command_date, proposal)
-                    message_id = st.session_state.get("command_center_message_id")
-                    if message_id:
-                        mark_command_center_message_applied(message_id)
+                    result = apply_selected_actions(actions, selected_action_ids)
                 except ValueError as error:
                     st.error(str(error))
                     return
+                message_id = st.session_state.get("command_center_message_id")
+                if message_id and result["applied"] > 0:
+                    mark_command_center_message_applied(message_id)
                 st.success(
-                    "Applied proposal. "
-                    f"Morning check-in updated: {result['morning_checkin_updated']}; "
-                    f"commitments created: {result['personal_commitments_created']}; "
-                    f"daily review updated: {result['daily_review_updated']}; "
-                    f"memory candidates created: {result['memory_candidates_created']}."
+                    "Action engine finished. "
+                    f"Applied {result['applied']}, "
+                    f"skipped {result['skipped']}, "
+                    f"duplicates {result['duplicates']}."
                 )
                 st.session_state.pop("command_center_proposal", None)
                 st.session_state.pop("command_center_message_id", None)
                 st.rerun()
-        with columns[1]:
-            if st.button("Discard Proposal"):
-                st.session_state.pop("command_center_proposal", None)
-                st.session_state.pop("command_center_message_id", None)
-                st.rerun()
+        if st.button("Discard Proposal"):
+            st.session_state.pop("command_center_proposal", None)
+            st.session_state.pop("command_center_message_id", None)
+            st.rerun()
 
 
 def render_command_center_history(command_date):
