@@ -1,6 +1,5 @@
 from datetime import date, datetime, timedelta
 
-ACTIVE_STATUSES = {"suggested", "confirmed", "in_progress"}
 INACTIVE_STATUSES = {"done", "ignored"}
 
 
@@ -126,7 +125,7 @@ def updated_sort_key(task):
     value = task.get("updated_at") or ""
     try:
         updated_at = datetime.fromisoformat(value)
-    except ValueError:
+    except (TypeError, ValueError):
         updated_at = datetime.min
 
     return updated_at
