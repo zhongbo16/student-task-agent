@@ -3,6 +3,7 @@ from datetime import date, datetime
 from typing import Optional
 
 VALID_STATUSES = ("suggested", "confirmed", "ignored", "in_progress", "done")
+VALID_CONFIDENCES = ("high", "medium", "low")
 
 TASK_COLUMNS = (
     "id",
@@ -14,7 +15,10 @@ TASK_COLUMNS = (
     "estimated_minutes",
     "priority",
     "status",
+    "source",
+    "confidence",
     "notes",
+    "source_snippet",
     "created_at",
     "updated_at",
 )
@@ -30,7 +34,10 @@ class Task:
     estimated_minutes: Optional[int] = None
     priority: int = 3
     status: str = "confirmed"
+    source: str = "manual"
+    confidence: Optional[str] = None
     notes: Optional[str] = None
+    source_snippet: Optional[str] = None
 
 
 def _clean_text(value):
@@ -77,6 +84,14 @@ def normalize_task(task):
     if status not in VALID_STATUSES:
         raise ValueError(f"Status must be one of: {', '.join(VALID_STATUSES)}.")
 
+    confidence = _clean_text(task.get("confidence"))
+    if confidence:
+        confidence = confidence.lower()
+        if confidence not in VALID_CONFIDENCES:
+            raise ValueError(
+                f"Confidence must be one of: {', '.join(VALID_CONFIDENCES)}."
+            )
+
     return {
         "title": title,
         "course": _clean_text(task.get("course")),
@@ -86,5 +101,8 @@ def normalize_task(task):
         "estimated_minutes": estimated_minutes,
         "priority": priority,
         "status": status,
+        "source": _clean_text(task.get("source")) or "manual",
+        "confidence": confidence,
         "notes": _clean_text(task.get("notes")),
+        "source_snippet": _clean_text(task.get("source_snippet")),
     }

@@ -33,7 +33,12 @@ def _create_tasks_table(cursor, table_name="tasks"):
             status TEXT NOT NULL DEFAULT 'confirmed' CHECK (
                 status IN ('{allowed_statuses}')
             ),
+            source TEXT NOT NULL DEFAULT 'manual',
+            confidence TEXT CHECK (
+                confidence IS NULL OR confidence IN ('high', 'medium', 'low')
+            ),
             notes TEXT,
+            source_snippet TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -124,10 +129,22 @@ def _migrate_tasks_table(cursor, existing_columns):
     if "updated_at" in legacy_columns:
         updated_at_expr = f"COALESCE(updated_at, '{now}')"
 
+    source_expr = "'manual'"
+    if "source" in legacy_columns:
+        source_expr = "COALESCE(NULLIF(TRIM(source), ''), 'manual')"
+
+    confidence_expr = "NULL"
+    if "confidence" in legacy_columns:
+        confidence_expr = (
+            "CASE WHEN confidence IN ('high', 'medium', 'low') "
+            "THEN confidence ELSE NULL END"
+        )
+
     cursor.execute(f'''
         INSERT INTO tasks (
             id, title, course, task_type, due_at, planned_date,
-            estimated_minutes, priority, status, notes, created_at, updated_at
+            estimated_minutes, priority, status, source, confidence, notes,
+            source_snippet, created_at, updated_at
         )
         SELECT
             {id_expr},
@@ -139,7 +156,10 @@ def _migrate_tasks_table(cursor, existing_columns):
             {estimated_minutes_expr},
             {priority_expr},
             {status_expr},
+            {source_expr},
+            {confidence_expr},
             {text_expr("notes")},
+            {text_expr("source_snippet")},
             {created_at_expr},
             {updated_at_expr}
         FROM tasks_legacy
@@ -149,7 +169,8 @@ def _migrate_tasks_table(cursor, existing_columns):
 
 TASK_SELECT = '''
     SELECT id, title, course, task_type, due_at, planned_date,
-           estimated_minutes, priority, status, notes, created_at, updated_at
+           estimated_minutes, priority, status, source, confidence, notes,
+           source_snippet, created_at, updated_at
     FROM tasks
 '''
 
@@ -190,8 +211,9 @@ def create_task(task):
         cursor.execute('''
             INSERT INTO tasks (
                 title, course, task_type, due_at, planned_date,
-                estimated_minutes, priority, status, notes, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                estimated_minutes, priority, status, source, confidence, notes,
+                source_snippet, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             task["title"],
             task["course"],
@@ -201,7 +223,10 @@ def create_task(task):
             task["estimated_minutes"],
             task["priority"],
             task["status"],
+            task["source"],
+            task["confidence"],
             task["notes"],
+            task["source_snippet"],
             now,
             now,
         ))
