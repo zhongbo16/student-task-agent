@@ -41,13 +41,17 @@ The app currently supports manual task tracking, syllabus PDF upload, AI-assiste
   - Manually store long-term preferences, rules, goals, and patterns
   - Deactivate memories without deleting raw data
   - Seed default AI Boss foundation memories without duplicates
+- AI Boss v0
+  - Generates a daily execution briefing from compact local context
+  - Reads tasks, Today Plan, focus sessions, daily reviews, and agent memory
+  - Saves briefings locally without automatically changing task status
 - Data retention foundation
   - SQLite backups before schema migrations when practical
   - Raw data preserved for future agent memory
 
 ## Not Implemented Yet
 
-- AI Boss / autonomous agent behavior
+- Autonomous AI task editing
 - Screen monitoring
 - Multi-user accounts
 - Cloud deployment
@@ -64,7 +68,9 @@ The app currently supports manual task tracking, syllabus PDF upload, AI-assiste
 - `planner.py` - rule-based task sorting and Today Plan
 - `file_parser.py` - PDF metadata and text extraction
 - `ai_parser.py` - AI syllabus task extraction
+- `ai_boss.py` - AI Boss context building and briefing generation
 - `canvas_client.py` - read-only Canvas API client
+- `prompts/ai_boss.md` - AI Boss guardrails and JSON output prompt
 - `docs/agent_memory_plan.md` - future agent memory plan
 
 ## Setup
@@ -121,5 +127,6 @@ Main persisted data:
 - `study_sessions`
 - `daily_reviews`
 - `agent_memory`
+- `ai_boss_briefings`
 
 Future AI memory should summarize patterns from raw data without overwriting raw data.

@@ -1,10 +1,18 @@
 import hashlib
+import json
 import re
 from datetime import date, datetime
 from pathlib import Path
 
 import streamlit as st
 
+from ai_boss import (
+    AIBossConfigError,
+    AIBossResponseError,
+    build_ai_boss_context,
+    generate_ai_boss_briefing,
+    has_openai_api_key,
+)
 from ai_parser import extract_tasks_from_text
 from canvas_client import (
     get_all_assignments,
@@ -25,13 +33,16 @@ from db import (
     get_active_agent_memory,
     get_all_tasks,
     get_daily_review_by_date,
+    get_latest_ai_boss_briefing,
     memory_exists,
+    get_recent_ai_boss_briefings,
     get_recent_study_sessions,
     get_recent_daily_reviews,
     get_tasks_by_status,
     get_this_week_tasks,
     get_today_tasks,
     init_db,
+    save_ai_boss_briefing,
     update_task_status,
 )
 from file_parser import extract_text_from_pdf, get_file_metadata
@@ -43,6 +54,7 @@ EXPORT_DIR = BASE_DIR / "data" / "exports"
 
 MENU_OPTIONS = [
     "Today Plan",
+    "AI Boss",
     "Focus Session",
     "Daily Review",
     "Agent Memory",
@@ -418,6 +430,225 @@ def render_today_plan():
             st.markdown(f"**Priority:** {display_value(task['priority'])}")
             st.markdown(f"**Status:** {display_value(task['status'])}")
             st.markdown(f"**Reason:** {recommendation['reason']}")
+
+
+def task_lookup_by_id(tasks):
+    return {str(task["id"]): task for task in tasks if task.get("id") is not None}
+
+
+def current_ai_boss_context():
+    tasks = get_all_tasks()
+    today_plan = generate_today_plan(tasks, max_tasks=3)
+    recent_sessions = get_recent_study_sessions(limit=20)
+    recent_reviews = get_recent_daily_reviews(limit=7)
+    memories = get_active_agent_memory()
+
+    context = build_ai_boss_context(
+        tasks=tasks,
+        today_plan=today_plan,
+        recent_study_sessions=recent_sessions,
+        recent_daily_reviews=recent_reviews,
+        active_memories=memories,
+        current_date=date.today().isoformat(),
+    )
+    return context, tasks
+
+
+def parse_saved_ai_boss_briefing(record):
+    if not record or not record.get("output_json"):
+        return None
+
+    try:
+        return json.loads(record["output_json"])
+    except json.JSONDecodeError:
+        return None
+
+
+def render_ai_boss_status(context):
+    st.markdown("### Status")
+    key_present = has_openai_api_key()
+    st.markdown(f"**OPENAI_API_KEY configured:** {'Yes' if key_present else 'No'}")
+    if not key_present:
+        st.warning(
+            "Add OPENAI_API_KEY to your .env file to generate an AI Boss briefing."
+        )
+
+    counts = context["counts"]
+    columns = st.columns(4)
+    columns[0].metric("Active Tasks", counts["active_tasks"])
+    columns[1].metric("Study Sessions", counts["recent_study_sessions"])
+    columns[2].metric("Daily Reviews", counts["recent_daily_reviews"])
+    columns[3].metric("Active Memories", counts["active_memories"])
+
+
+def render_ai_boss_task_card(task, task_lookup):
+    task_id = task.get("task_id")
+    existing_task = task_lookup.get(str(task_id)) if task_id else None
+
+    with st.container(border=True):
+        st.markdown(f"#### {display_value(task.get('title'))}")
+        columns = st.columns(3)
+        columns[0].markdown(f"**Course**  \n{display_value(task.get('course'))}")
+        columns[1].markdown(
+            "**Estimated**  \n"
+            f"{display_value(task.get('estimated_minutes'))} min"
+        )
+        columns[2].markdown(f"**Task ID**  \n{display_value(task_id)}")
+
+        if existing_task:
+            columns = st.columns(3)
+            columns[0].markdown(
+                f"**Current Status**  \n{display_value(existing_task.get('status'))}"
+            )
+            columns[1].markdown(
+                f"**Due**  \n{display_value(existing_task.get('due_at'))}"
+            )
+            columns[2].markdown(
+                "**Planned**  \n"
+                f"{display_value(existing_task.get('planned_date'))}"
+            )
+
+        st.markdown(f"**Reason**  \n{display_value(task.get('reason'))}")
+        st.markdown(
+            f"**First action**  \n{display_value(task.get('first_action'))}"
+        )
+
+
+def render_ai_boss_briefing(briefing, task_lookup):
+    if not briefing:
+        st.info("No AI Boss briefing to display yet.")
+        return
+
+    st.markdown("### Executive Summary")
+    st.write(display_value(briefing.get("executive_summary")))
+
+    st.markdown("### Top Tasks")
+    top_tasks = briefing.get("top_tasks") or []
+    if not top_tasks:
+        st.info("No top tasks were returned.")
+    for task in top_tasks[:3]:
+        render_ai_boss_task_card(task, task_lookup)
+
+    st.markdown("### First 25-Minute Action")
+    st.write(display_value(briefing.get("first_25_minute_action")))
+
+    avoid_doing = briefing.get("avoid_doing") or []
+    if avoid_doing:
+        st.markdown("### Avoid Doing")
+        for item in avoid_doing:
+            st.markdown(f"- {display_value(item)}")
+
+    if briefing.get("avoidance_warning"):
+        st.markdown("### Avoidance Warning")
+        st.warning(briefing["avoidance_warning"])
+
+    st.markdown("### Schedule Advice")
+    st.write(display_value(briefing.get("schedule_advice")))
+
+    st.markdown("### End-of-Day Check-In")
+    st.write(display_value(briefing.get("end_of_day_check_in_question")))
+
+
+def render_ai_boss_generate(context, task_lookup):
+    st.markdown("### Generate Briefing")
+    st.caption(
+        "AI Boss only reads the compact local context shown by this page. "
+        "It does not update tasks or touch Quercus."
+    )
+
+    key_present = has_openai_api_key()
+    if st.button("Generate AI Boss Briefing", disabled=not key_present):
+        with st.spinner("Generating AI Boss briefing..."):
+            try:
+                briefing = generate_ai_boss_briefing(context)
+                raw_response = briefing.get("_raw_response")
+                briefing_for_save = {
+                    key: value for key, value in briefing.items()
+                    if key != "_raw_response"
+                }
+                save_ai_boss_briefing(
+                    briefing_date=context["current_date"],
+                    input_summary_json=json.dumps(context, ensure_ascii=False),
+                    output_json=json.dumps(briefing_for_save, ensure_ascii=False),
+                    raw_response=raw_response,
+                )
+            except AIBossConfigError as error:
+                st.error(str(error))
+                return
+            except AIBossResponseError as error:
+                st.error(str(error))
+                if error.raw_response:
+                    st.text_area(
+                        "Raw AI response",
+                        value=error.raw_response,
+                        height=240,
+                    )
+                return
+            except Exception as error:
+                st.error(f"Could not generate AI Boss briefing: {error}")
+                return
+
+        st.success("AI Boss briefing saved.")
+        render_ai_boss_briefing(briefing_for_save, task_lookup)
+
+
+def render_latest_ai_boss_briefing(task_lookup):
+    st.markdown("### Latest Briefing")
+    latest = get_latest_ai_boss_briefing(date.today().isoformat())
+    if not latest:
+        st.info("No AI Boss briefing saved for today yet.")
+        return
+
+    st.caption(
+        f"Saved {display_datetime(latest['created_at'])} "
+        f"for {latest['briefing_date']}."
+    )
+    briefing = parse_saved_ai_boss_briefing(latest)
+    if not briefing:
+        st.warning("The latest saved AI Boss briefing could not be parsed.")
+        return
+    render_ai_boss_briefing(briefing, task_lookup)
+
+
+def render_recent_ai_boss_briefings():
+    st.markdown("### Recent Briefings")
+    briefings = get_recent_ai_boss_briefings(limit=7)
+    if not briefings:
+        st.info("No saved AI Boss briefings yet.")
+        return
+
+    for record in briefings:
+        briefing = parse_saved_ai_boss_briefing(record)
+        title = (
+            f"{record['briefing_date']} - "
+            f"{display_datetime(record['created_at'])}"
+        )
+        with st.expander(title):
+            if not briefing:
+                st.warning("This saved briefing could not be parsed.")
+                continue
+            st.markdown(f"**Summary**  \n{display_value(briefing.get('executive_summary'))}")
+            st.markdown(
+                "**First 25-minute action**  \n"
+                f"{display_value(briefing.get('first_25_minute_action'))}"
+            )
+
+
+def render_ai_boss():
+    st.subheader("AI Boss")
+    st.info(
+        "AI Boss v0 generates a daily execution briefing from your local tasks, "
+        "Today Plan, focus sessions, daily reviews, and active agent memories. "
+        "It can suggest priorities, but it does not automatically change tasks."
+    )
+
+    context, tasks = current_ai_boss_context()
+    task_lookup = task_lookup_by_id(tasks)
+
+    render_ai_boss_status(context)
+    render_ai_boss_generate(context, task_lookup)
+    render_latest_ai_boss_briefing(task_lookup)
+    render_recent_ai_boss_briefings()
 
 
 def file_extraction_key(filename, extracted_text):
@@ -1035,6 +1266,8 @@ def main():
 
     if choice == "Today Plan":
         render_today_plan()
+    elif choice == "AI Boss":
+        render_ai_boss()
     elif choice == "Focus Session":
         render_focus_session()
     elif choice == "Daily Review":

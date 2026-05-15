@@ -141,6 +141,19 @@ def _create_agent_memory_table(cursor):
     ''')
 
 
+def _create_ai_boss_briefings_table(cursor):
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS ai_boss_briefings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            briefing_date TEXT NOT NULL,
+            input_summary_json TEXT,
+            output_json TEXT,
+            raw_response TEXT,
+            created_at TEXT
+        )
+    ''')
+
+
 def _table_columns(cursor, table_name):
     cursor.execute(f"PRAGMA table_info({table_name})")
     return [row["name"] for row in cursor.fetchall()]
@@ -187,7 +200,13 @@ def _database_needs_backup_before_init():
         )
         daily_reviews_missing = not _table_exists(cursor, "daily_reviews")
         agent_memory_missing = not _table_exists(cursor, "agent_memory")
-        return tasks_need_migration or daily_reviews_missing or agent_memory_missing
+        ai_boss_briefings_missing = not _table_exists(cursor, "ai_boss_briefings")
+        return (
+            tasks_need_migration
+            or daily_reviews_missing
+            or agent_memory_missing
+            or ai_boss_briefings_missing
+        )
 
 
 def _migrate_tasks_table(cursor, existing_columns):
@@ -326,6 +345,7 @@ def init_db():
 
     init_daily_reviews_table(create_backup=False)
     init_agent_memory_table(create_backup=False)
+    init_ai_boss_briefings_table(create_backup=False)
 
 
 def backup_database():
@@ -372,6 +392,27 @@ def init_agent_memory_table(create_backup=True):
     with closing(_connect()) as conn:
         cursor = conn.cursor()
         _create_agent_memory_table(cursor)
+        conn.commit()
+
+
+def init_ai_boss_briefings_table(create_backup=True):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    ai_boss_briefings_missing = True
+    if DB_PATH.exists():
+        with closing(_connect()) as conn:
+            cursor = conn.cursor()
+            ai_boss_briefings_missing = not _table_exists(
+                cursor,
+                "ai_boss_briefings",
+            )
+
+    if ai_boss_briefings_missing and create_backup:
+        backup_database()
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        _create_ai_boss_briefings_table(cursor)
         conn.commit()
 
 
@@ -1066,6 +1107,77 @@ def memory_exists(memory_type, memory_key):
             (memory_type, memory_key),
         )
         return cursor.fetchone() is not None
+
+
+def save_ai_boss_briefing(
+    briefing_date,
+    input_summary_json,
+    output_json,
+    raw_response=None,
+):
+    briefing_date = _clean_review_date(briefing_date)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO ai_boss_briefings (
+                briefing_date, input_summary_json, output_json,
+                raw_response, created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ''',
+            (
+                briefing_date,
+                input_summary_json,
+                output_json,
+                raw_response,
+                now,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_latest_ai_boss_briefing(briefing_date=None):
+    params = ()
+    where_clause = ""
+    if briefing_date:
+        where_clause = "WHERE briefing_date = ?"
+        params = (_clean_review_date(briefing_date),)
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f'''
+            SELECT id, briefing_date, input_summary_json, output_json,
+                   raw_response, created_at
+            FROM ai_boss_briefings
+            {where_clause}
+            ORDER BY created_at DESC, id DESC
+            LIMIT 1
+            ''',
+            params,
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def get_recent_ai_boss_briefings(limit=7):
+    limit = max(1, int(limit))
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, briefing_date, input_summary_json, output_json,
+                   raw_response, created_at
+            FROM ai_boss_briefings
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            ''',
+            (limit,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
 
 
 def delete_task(task_id):

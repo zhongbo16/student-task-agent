@@ -30,9 +30,9 @@ Examples of derived memory:
 
 MVP-13 supports manual memory creation and default seed memories. It does not automatically summarize raw data yet.
 
-## Future AI Boss
+## AI Boss v0
 
-Future AI Boss features should use:
+MVP-14 adds AI Boss v0. It reads a compact snapshot of:
 
 - current tasks
 - Today Plan
@@ -40,7 +40,13 @@ Future AI Boss features should use:
 - recent daily_reviews
 - active agent_memory
 
-The AI Boss should treat raw execution data as evidence and active memories as user-controlled guidance.
+AI Boss v0 generates a daily execution briefing and saves it to
+`ai_boss_briefings`. It can recommend priorities and first actions, but it does
+not automatically edit tasks, mark tasks complete, change deadlines, or write to
+Quercus.
+
+Future AI Boss features should continue to treat raw execution data as evidence
+and active memories as user-controlled guidance.
 
 ## User Control
 
