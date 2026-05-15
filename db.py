@@ -216,6 +216,21 @@ def _create_task_candidates_table(cursor):
     ''')
 
 
+def _create_course_archives_table(cursor):
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS course_archives (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            course_key TEXT NOT NULL UNIQUE,
+            course_name TEXT NOT NULL,
+            is_active INTEGER DEFAULT 1 CHECK (is_active IN (0, 1)),
+            reason TEXT,
+            archived_at TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+    ''')
+
+
 def _table_columns(cursor, table_name):
     cursor.execute(f"PRAGMA table_info({table_name})")
     return [row["name"] for row in cursor.fetchall()]
@@ -264,12 +279,14 @@ def _database_needs_backup_before_init():
         agent_memory_missing = not _table_exists(cursor, "agent_memory")
         ai_boss_briefings_missing = not _table_exists(cursor, "ai_boss_briefings")
         task_candidates_missing = not _table_exists(cursor, "task_candidates")
+        course_archives_missing = not _table_exists(cursor, "course_archives")
         return (
             tasks_need_migration
             or daily_reviews_missing
             or agent_memory_missing
             or ai_boss_briefings_missing
             or task_candidates_missing
+            or course_archives_missing
         )
 
 
@@ -470,6 +487,7 @@ def init_db():
         add_task_urgency_columns_if_missing(cursor)
         _create_study_sessions_table(cursor)
         _create_task_candidates_table(cursor)
+        _create_course_archives_table(cursor)
         conn.commit()
 
     init_daily_reviews_table(create_backup=False)
@@ -1426,6 +1444,15 @@ def _clean_candidate_minutes(value):
     return minutes if minutes > 0 else None
 
 
+def _clean_course_name(value):
+    text = _clean_candidate_text(value)
+    return text or "No course"
+
+
+def _course_key(value):
+    return _clean_course_name(value).casefold()
+
+
 def _normalize_candidate(candidate):
     title = _clean_candidate_text(candidate.get("title"))
     if not title:
@@ -1555,6 +1582,47 @@ def get_pending_task_candidates():
     )
 
 
+def get_task_candidates(
+    decision_status="pending",
+    course=None,
+    source=None,
+    due_filter=None,
+):
+    clauses = []
+    params = []
+    if decision_status:
+        clauses.append("decision_status = ?")
+        params.append(decision_status)
+    if course and course != "All courses":
+        clauses.append("COALESCE(course, 'No course') = ?")
+        params.append(course)
+    if source and source != "All sources":
+        clauses.append("COALESCE(source, '') = ?")
+        params.append(source)
+
+    today = date.today().isoformat()
+    if due_filter == "No due date":
+        clauses.append("due_at IS NULL")
+    elif due_filter == "Due today or earlier":
+        clauses.append("due_at IS NOT NULL AND due_at <= ?")
+        params.append(today)
+    elif due_filter == "Future due date":
+        clauses.append("due_at IS NOT NULL AND due_at > ?")
+        params.append(today)
+
+    where_clause = ""
+    if clauses:
+        where_clause = "WHERE " + " AND ".join(clauses)
+
+    return _fetch_task_candidates(
+        f'''
+        {where_clause}
+        ORDER BY urgency_score DESC, due_at ASC, created_at DESC
+        ''',
+        tuple(params),
+    )
+
+
 def get_task_candidate(candidate_id):
     candidates = _fetch_task_candidates("WHERE id = ? LIMIT 1", (candidate_id,))
     return candidates[0] if candidates else None
@@ -1631,12 +1699,20 @@ def _candidate_priority_for_task(value):
         return 3
 
 
-def promote_candidate_to_task(candidate_id, status="suggested"):
+def promote_candidate_to_task(candidate_id, status="suggested", allow_untrusted_confirm=False):
     candidate = get_task_candidate(candidate_id)
     if not candidate:
         return None
 
-    if status == "confirmed" and candidate.get("recommended_status") != "confirmed":
+    if is_course_archived(candidate.get("course")):
+        update_task_candidate_decision(candidate_id, "ignored")
+        return None
+
+    if (
+        status == "confirmed"
+        and candidate.get("recommended_status") != "confirmed"
+        and not allow_untrusted_confirm
+    ):
         status = "suggested"
     if status not in ("suggested", "confirmed"):
         status = "suggested"
@@ -1692,6 +1768,163 @@ def promote_candidate_to_task(candidate_id, status="suggested"):
         "auto_created" if status == "confirmed" else "accepted",
     )
     return task_id
+
+
+def get_archived_courses():
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, course_key, course_name, is_active, reason,
+                   archived_at, created_at, updated_at
+            FROM course_archives
+            WHERE is_active = 1
+            ORDER BY course_name ASC
+            '''
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def is_course_archived(course):
+    course_key = _course_key(course)
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT 1
+            FROM course_archives
+            WHERE course_key = ? AND is_active = 1
+            LIMIT 1
+            ''',
+            (course_key,),
+        )
+        return cursor.fetchone() is not None
+
+
+def archive_course(course, reason=None):
+    course_name = _clean_course_name(course)
+    course_key = _course_key(course_name)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO course_archives (
+                course_key, course_name, is_active, reason,
+                archived_at, created_at, updated_at
+            ) VALUES (?, ?, 1, ?, ?, ?, ?)
+            ON CONFLICT(course_key) DO UPDATE SET
+                course_name = excluded.course_name,
+                is_active = 1,
+                reason = excluded.reason,
+                archived_at = excluded.archived_at,
+                updated_at = excluded.updated_at
+            ''',
+            (course_key, course_name, reason, now, now, now),
+        )
+        cursor.execute(
+            '''
+            UPDATE tasks
+            SET status = 'ignored',
+                needs_review = 0,
+                urgency_score = 0,
+                urgency_label = 'low',
+                last_scored_at = ?,
+                updated_at = ?
+            WHERE COALESCE(course, 'No course') = ?
+              AND status NOT IN ('done', 'ignored')
+            ''',
+            (now, now, course_name),
+        )
+        tasks_ignored = cursor.rowcount
+        cursor.execute(
+            '''
+            UPDATE task_candidates
+            SET decision_status = 'ignored',
+                updated_at = ?
+            WHERE COALESCE(course, 'No course') = ?
+              AND decision_status = 'pending'
+            ''',
+            (now, course_name),
+        )
+        candidates_ignored = cursor.rowcount
+        conn.commit()
+
+    return {
+        "course_name": course_name,
+        "tasks_ignored": tasks_ignored,
+        "candidates_ignored": candidates_ignored,
+    }
+
+
+def unarchive_course(course):
+    course_name = _clean_course_name(course)
+    course_key = _course_key(course_name)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            UPDATE course_archives
+            SET is_active = 0,
+                updated_at = ?
+            WHERE course_key = ?
+            ''',
+            (now, course_key),
+        )
+        conn.commit()
+        return cursor.rowcount
+
+
+def get_course_summaries():
+    tasks = get_all_tasks()
+    candidates = _fetch_task_candidates()
+    archived = {
+        row["course_key"]: row for row in get_archived_courses()
+    }
+    summaries = {}
+
+    def summary_for(course):
+        course_name = _clean_course_name(course)
+        key = _course_key(course_name)
+        if key not in summaries:
+            summaries[key] = {
+                "course_key": key,
+                "course_name": course_name,
+                "active_tasks": 0,
+                "ignored_tasks": 0,
+                "done_tasks": 0,
+                "pending_candidates": 0,
+                "total_tasks": 0,
+                "archived": key in archived,
+            }
+        return summaries[key]
+
+    for task in tasks:
+        row = summary_for(task.get("course"))
+        row["total_tasks"] += 1
+        if task.get("status") in ("done",):
+            row["done_tasks"] += 1
+        elif task.get("status") == "ignored":
+            row["ignored_tasks"] += 1
+        else:
+            row["active_tasks"] += 1
+
+    for candidate in candidates:
+        if candidate.get("decision_status") == "pending":
+            summary_for(candidate.get("course"))["pending_candidates"] += 1
+
+    return sorted(
+        summaries.values(),
+        key=lambda row: (
+            not row["archived"],
+            -row["active_tasks"],
+            -row["pending_candidates"],
+            row["course_name"],
+        ),
+    )
 
 
 def get_recent_quercus_items(limit=100):

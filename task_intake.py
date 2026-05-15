@@ -11,6 +11,7 @@ from canvas_client import (
 from db import (
     create_task_candidate,
     get_recent_quercus_items,
+    is_course_archived,
     promote_candidate_to_task,
     rescore_all_active_tasks,
 )
@@ -191,6 +192,7 @@ def _empty_summary():
         "suggested_tasks_created": 0,
         "pending_candidates_created": 0,
         "duplicates_skipped": 0,
+        "skipped_archived_course": 0,
         "skipped_past_due": 0,
         "tasks_rescored": 0,
         "errors": [],
@@ -199,6 +201,10 @@ def _empty_summary():
 
 def _handle_candidate(candidate, summary):
     summary["candidates_found"] += 1
+    if is_course_archived(candidate.get("course")):
+        summary["skipped_archived_course"] += 1
+        return
+
     if _is_past_due(candidate):
         summary["skipped_past_due"] += 1
         return

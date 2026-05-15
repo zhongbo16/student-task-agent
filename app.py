@@ -21,6 +21,7 @@ from canvas_client import (
     has_canvas_base_url,
 )
 from db import (
+    archive_course,
     complete_study_session,
     create_agent_memory,
     create_or_update_daily_review,
@@ -34,8 +35,9 @@ from db import (
     get_all_tasks,
     get_daily_review_by_date,
     get_latest_ai_boss_briefing,
+    get_course_summaries,
     memory_exists,
-    get_pending_task_candidates,
+    get_task_candidates,
     get_recent_ai_boss_briefings,
     get_recent_study_sessions,
     get_recent_daily_reviews,
@@ -47,6 +49,7 @@ from db import (
     promote_candidate_to_task,
     rescore_all_active_tasks,
     save_ai_boss_briefing,
+    unarchive_course,
     update_task_candidate_decision,
     update_task_status,
 )
@@ -870,7 +873,7 @@ def render_quercus_sync():
 
 def render_intake_summary(summary):
     st.markdown("### Intake Summary")
-    columns = st.columns(6)
+    columns = st.columns(7)
     columns[0].metric("Candidates Found", summary["candidates_found"])
     columns[1].metric(
         "Confirmed Created",
@@ -879,7 +882,8 @@ def render_intake_summary(summary):
     columns[2].metric("Suggested Created", summary["suggested_tasks_created"])
     columns[3].metric("Pending", summary["pending_candidates_created"])
     columns[4].metric("Duplicates", summary["duplicates_skipped"])
-    columns[5].metric("Past Due Skipped", summary.get("skipped_past_due", 0))
+    columns[5].metric("Archived Skipped", summary.get("skipped_archived_course", 0))
+    columns[6].metric("Past Due Skipped", summary.get("skipped_past_due", 0))
     st.markdown(f"**Tasks rescored:** {summary['tasks_rescored']}")
 
     if summary["errors"]:
@@ -927,6 +931,60 @@ def render_past_quercus_cleanup():
         st.rerun()
 
 
+def render_course_archive():
+    st.markdown("### Course Archive")
+    st.caption(
+        "Archive old or irrelevant courses so their active tasks and pending "
+        "candidates stop appearing in plans. This does not delete raw data."
+    )
+
+    summaries = get_course_summaries()
+    if not summaries:
+        st.info("No courses found yet.")
+        return
+
+    for summary in summaries:
+        with st.container(border=True):
+            title = summary["course_name"]
+            if summary["archived"]:
+                title = f"{title} (archived)"
+            st.markdown(f"#### {display_value(title)}")
+
+            columns = st.columns(5)
+            columns[0].metric("Active", summary["active_tasks"])
+            columns[1].metric("Pending", summary["pending_candidates"])
+            columns[2].metric("Ignored", summary["ignored_tasks"])
+            columns[3].metric("Done", summary["done_tasks"])
+            columns[4].metric("Total", summary["total_tasks"])
+
+            if summary["archived"]:
+                if st.button(
+                    "Unarchive Course",
+                    key=f"unarchive-course-{summary['course_key']}",
+                ):
+                    unarchive_course(summary["course_name"])
+                    st.success(
+                        f"Unarchived {summary['course_name']}. "
+                        "Previously ignored tasks stay ignored."
+                    )
+                    st.rerun()
+            else:
+                if st.button(
+                    "Archive Course",
+                    key=f"archive-course-{summary['course_key']}",
+                ):
+                    result = archive_course(
+                        summary["course_name"],
+                        reason="Archived manually from Task Intake.",
+                    )
+                    st.success(
+                        f"Archived {result['course_name']}. "
+                        f"Ignored {result['tasks_ignored']} active tasks and "
+                        f"{result['candidates_ignored']} pending candidates."
+                    )
+                    st.rerun()
+
+
 def render_candidate_fields(candidate):
     columns = st.columns(4)
     columns[0].markdown(f"**Course**  \n{display_value(candidate['course'])}")
@@ -956,12 +1014,121 @@ def render_candidate_fields(candidate):
         st.markdown(f"**Source URL**  \n{candidate['source_url']}")
 
 
+def candidate_option_label(candidate):
+    due = candidate.get("due_at") or "no due date"
+    course = candidate.get("course") or "No course"
+    source = candidate.get("source") or "-"
+    return f"{candidate['title']} | {course} | {source} | {due}"
+
+
+def candidate_filter_options(candidates, key):
+    values = sorted({
+        candidate.get(key) or ("No course" if key == "course" else "")
+        for candidate in candidates
+    })
+    values = [value for value in values if value]
+    prefix = "All courses" if key == "course" else "All sources"
+    return [prefix, *values]
+
+
+def filtered_pending_candidates():
+    all_candidates = get_task_candidates(decision_status="pending")
+    if not all_candidates:
+        return [], [], "All courses", "All sources", "Any due date"
+
+    course_filter = st.selectbox(
+        "Candidate course filter",
+        options=candidate_filter_options(all_candidates, "course"),
+        key="candidate-course-filter",
+    )
+    source_filter = st.selectbox(
+        "Candidate source filter",
+        options=candidate_filter_options(all_candidates, "source"),
+        key="candidate-source-filter",
+    )
+    due_filter = st.selectbox(
+        "Candidate due date filter",
+        options=[
+            "Any due date",
+            "No due date",
+            "Due today or earlier",
+            "Future due date",
+        ],
+        key="candidate-due-filter",
+    )
+    query_due_filter = None if due_filter == "Any due date" else due_filter
+    candidates = get_task_candidates(
+        decision_status="pending",
+        course=course_filter,
+        source=source_filter,
+        due_filter=query_due_filter,
+    )
+    return candidates, all_candidates, course_filter, source_filter, due_filter
+
+
+def render_batch_candidate_actions(candidates):
+    if not candidates:
+        return
+
+    candidate_lookup = {candidate["id"]: candidate for candidate in candidates}
+    selected_ids = st.multiselect(
+        "Select candidates for batch action",
+        options=list(candidate_lookup.keys()),
+        format_func=lambda candidate_id: candidate_option_label(
+            candidate_lookup[candidate_id]
+        ),
+        key="batch-candidate-selection",
+    )
+    if not selected_ids:
+        return
+
+    columns = st.columns(3)
+    with columns[0]:
+        if st.button("Batch Accept as Confirmed"):
+            created = 0
+            skipped = 0
+            for candidate_id in selected_ids:
+                if promote_candidate_to_task(
+                    candidate_id,
+                    status="confirmed",
+                    allow_untrusted_confirm=True,
+                ):
+                    created += 1
+                else:
+                    skipped += 1
+            st.success(f"Created {created} confirmed tasks. Skipped {skipped}.")
+            st.rerun()
+    with columns[1]:
+        if st.button("Batch Accept as Suggested"):
+            created = 0
+            skipped = 0
+            for candidate_id in selected_ids:
+                if promote_candidate_to_task(candidate_id, status="suggested"):
+                    created += 1
+                else:
+                    skipped += 1
+            st.success(f"Created {created} suggested tasks. Skipped {skipped}.")
+            st.rerun()
+    with columns[2]:
+        if st.button("Batch Ignore"):
+            for candidate_id in selected_ids:
+                update_task_candidate_decision(candidate_id, "ignored")
+            st.success(f"Ignored {len(selected_ids)} candidates.")
+            st.rerun()
+
+
 def render_pending_task_candidates():
     st.markdown("### Pending Task Candidates")
-    candidates = get_pending_task_candidates()
-    if not candidates:
+    candidates, all_candidates, _, _, _ = filtered_pending_candidates()
+    if not all_candidates:
         st.info("No pending task candidates right now.")
         return
+    if not candidates:
+        st.info("No candidates match the current filters.")
+        return
+
+    st.caption(f"Showing {len(candidates)} of {len(all_candidates)} pending candidates.")
+    render_batch_candidate_actions(candidates)
 
     for candidate in candidates:
         with st.container(border=True):
@@ -977,6 +1144,7 @@ def render_pending_task_candidates():
                     task_id = promote_candidate_to_task(
                         candidate["id"],
                         status="confirmed",
+                        allow_untrusted_confirm=True,
                     )
                     if task_id:
                         st.success("Candidate accepted as confirmed task.")
@@ -1062,6 +1230,7 @@ def render_task_intake():
     st.subheader("Task Intake")
     render_task_intake_controls()
     render_past_quercus_cleanup()
+    render_course_archive()
     render_pending_task_candidates()
     render_top_urgent_tasks()
     render_rescore_tasks()

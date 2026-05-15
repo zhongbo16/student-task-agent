@@ -49,6 +49,7 @@ The app currently supports manual task tracking, syllabus PDF upload, AI-assiste
   - Discovers clear trusted Canvas assignment tasks
   - Keeps uncertain items in a pending task inbox
   - Scores active tasks with urgency labels for planning
+  - Supports course archive and batch candidate review
 - Data retention foundation
   - SQLite backups before schema migrations when practical
   - Raw data preserved for future agent memory
@@ -135,5 +136,6 @@ Main persisted data:
 - `agent_memory`
 - `ai_boss_briefings`
 - `task_candidates`
+- `course_archives`
 
 Future AI memory should summarize patterns from raw data without overwriting raw data.
