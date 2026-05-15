@@ -22,6 +22,11 @@ TASK_COLUMNS = (
     "external_id",
     "external_source",
     "external_url",
+    "urgency_score",
+    "urgency_label",
+    "auto_created",
+    "needs_review",
+    "last_scored_at",
     "created_at",
     "updated_at",
 )
@@ -44,6 +49,11 @@ class Task:
     external_id: Optional[str] = None
     external_source: Optional[str] = None
     external_url: Optional[str] = None
+    urgency_score: float = 0
+    urgency_label: Optional[str] = None
+    auto_created: int = 0
+    needs_review: int = 0
+    last_scored_at: Optional[str] = None
 
 
 def _clean_text(value):
@@ -98,6 +108,21 @@ def normalize_task(task):
                 f"Confidence must be one of: {', '.join(VALID_CONFIDENCES)}."
             )
 
+    urgency_score = task.get("urgency_score")
+    if urgency_score in (None, ""):
+        urgency_score = 0
+    else:
+        urgency_score = float(urgency_score)
+
+    auto_created = task.get("auto_created")
+    auto_created = 1 if auto_created not in (None, "", 0, "0", False) else 0
+
+    needs_review = task.get("needs_review")
+    if needs_review in (None, ""):
+        needs_review = 1 if status == "suggested" else 0
+    else:
+        needs_review = 1 if needs_review not in (0, "0", False) else 0
+
     return {
         "title": title,
         "course": _clean_text(task.get("course")),
@@ -114,4 +139,9 @@ def normalize_task(task):
         "external_id": _clean_text(task.get("external_id")),
         "external_source": _clean_text(task.get("external_source")),
         "external_url": _clean_text(task.get("external_url")),
+        "urgency_score": urgency_score,
+        "urgency_label": _clean_text(task.get("urgency_label")),
+        "auto_created": auto_created,
+        "needs_review": needs_review,
+        "last_scored_at": _clean_text(task.get("last_scored_at")),
     }

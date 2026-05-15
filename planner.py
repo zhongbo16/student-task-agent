@@ -1,5 +1,7 @@
 from datetime import date, datetime, timedelta
 
+from urgency import calculate_urgency_score
+
 INACTIVE_STATUSES = {"done", "ignored"}
 
 
@@ -121,6 +123,18 @@ def task_sort_key(task, today=None):
     )
 
 
+def urgency_score_value(task, today=None):
+    stored_score = task.get("urgency_score")
+    if stored_score not in (None, ""):
+        try:
+            return float(stored_score)
+        except (TypeError, ValueError):
+            pass
+
+    score, _, _ = calculate_urgency_score(task, today)
+    return score
+
+
 def updated_sort_key(task):
     value = task.get("updated_at") or ""
     try:
@@ -135,7 +149,13 @@ def sort_tasks_for_dashboard(tasks, view_name, today=None):
     if view_name == "Completed":
         return sorted(tasks, key=updated_sort_key, reverse=True)
 
-    return sorted(tasks, key=lambda task: task_sort_key(task, today))
+    return sorted(
+        tasks,
+        key=lambda task: (
+            -urgency_score_value(task, today),
+            task_sort_key(task, today),
+        ),
+    )
 
 
 def task_indicators(task, today=None):
@@ -150,6 +170,10 @@ def task_indicators(task, today=None):
         indicators.append("Planned today")
     if priority_score(task) >= 5:
         indicators.append("High priority")
+
+    urgency_label = task.get("urgency_label")
+    if urgency_label:
+        indicators.append(f"Urgency: {urgency_label}")
 
     return indicators
 
@@ -202,6 +226,7 @@ def today_plan_sort_key(task, today=None):
     today = today or date.today()
 
     return (
+        -urgency_score_value(task, today),
         not is_overdue(task, today),
         not is_due_today(task, today),
         not is_planned_today(task, today),

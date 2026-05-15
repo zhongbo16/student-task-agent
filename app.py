@@ -35,6 +35,7 @@ from db import (
     get_daily_review_by_date,
     get_latest_ai_boss_briefing,
     memory_exists,
+    get_pending_task_candidates,
     get_recent_ai_boss_briefings,
     get_recent_study_sessions,
     get_recent_daily_reviews,
@@ -42,11 +43,16 @@ from db import (
     get_this_week_tasks,
     get_today_tasks,
     init_db,
+    promote_candidate_to_task,
+    rescore_all_active_tasks,
     save_ai_boss_briefing,
+    update_task_candidate_decision,
     update_task_status,
 )
 from file_parser import extract_text_from_pdf, get_file_metadata
 from planner import generate_today_plan, sort_tasks_for_dashboard, task_indicators
+from task_intake import run_auto_task_intake
+from urgency import calculate_urgency_score
 
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
@@ -55,6 +61,7 @@ EXPORT_DIR = BASE_DIR / "data" / "exports"
 MENU_OPTIONS = [
     "Today Plan",
     "AI Boss",
+    "Task Intake",
     "Focus Session",
     "Daily Review",
     "Agent Memory",
@@ -189,6 +196,19 @@ def display_date(task):
     return "No date"
 
 
+def task_urgency(task):
+    score = task.get("urgency_score")
+    label = task.get("urgency_label")
+    if label and score not in (None, ""):
+        try:
+            return float(score), label
+        except (TypeError, ValueError):
+            pass
+
+    score, label, _ = calculate_urgency_score(task)
+    return score, label
+
+
 def display_datetime(value):
     if not value:
         return "-"
@@ -275,6 +295,18 @@ def render_task_fields(task):
     second_row[1].markdown(f"**Priority**  \n{display_value(task['priority'])}")
     second_row[2].markdown(f"**Status**  \n{display_value(task['status'])}")
     second_row[3].markdown(f"**Notes**  \n{display_value(task['notes'])}")
+
+    urgency_score, urgency_label = task_urgency(task)
+    urgency_row = st.columns(3)
+    urgency_row[0].markdown(
+        f"**Urgency**  \n{display_value(urgency_label)}"
+    )
+    urgency_row[1].markdown(
+        f"**Urgency Score**  \n{urgency_score:.1f}"
+    )
+    urgency_row[2].markdown(
+        f"**Needs Review**  \n{display_value(task.get('needs_review'))}"
+    )
 
     has_extraction_fields = (
         task.get("source") not in (None, "", "manual")
@@ -420,6 +452,7 @@ def render_today_plan():
 
     for index, recommendation in enumerate(recommendations, start=1):
         task = recommendation["task"]
+        urgency_score, urgency_label = task_urgency(task)
         with st.container(border=True):
             st.markdown(f"### {index}. {display_value(task['title'])}")
             st.markdown(f"**Course:** {display_value(task['course'])}")
@@ -429,6 +462,10 @@ def render_today_plan():
             st.markdown(f"**Date:** {display_date(task)}")
             st.markdown(f"**Priority:** {display_value(task['priority'])}")
             st.markdown(f"**Status:** {display_value(task['status'])}")
+            st.markdown(
+                f"**Urgency:** {display_value(urgency_label)} "
+                f"({urgency_score:.1f})"
+            )
             st.markdown(f"**Reason:** {recommendation['reason']}")
 
 
@@ -828,6 +865,185 @@ def render_quercus_sync():
             )
         else:
             st.success("Quercus/Canvas assignment sync finished.")
+
+
+def render_intake_summary(summary):
+    st.markdown("### Intake Summary")
+    columns = st.columns(5)
+    columns[0].metric("Candidates Found", summary["candidates_found"])
+    columns[1].metric(
+        "Confirmed Created",
+        summary["confirmed_tasks_auto_created"],
+    )
+    columns[2].metric("Suggested Created", summary["suggested_tasks_created"])
+    columns[3].metric("Pending", summary["pending_candidates_created"])
+    columns[4].metric("Duplicates", summary["duplicates_skipped"])
+    st.markdown(f"**Tasks rescored:** {summary['tasks_rescored']}")
+
+    if summary["errors"]:
+        for error in summary["errors"]:
+            st.warning(error)
+
+
+def render_task_intake_controls():
+    st.markdown("### Auto Intake Controls")
+    st.info(
+        "Auto Intake discovers tasks from trusted sources, scores urgency, "
+        "and inserts clear trusted tasks as confirmed while keeping uncertain "
+        "items pending for review. It does not call AI automatically."
+    )
+    st.caption(
+        "For now, Auto Intake runs only when you click the button. Later, a "
+        "deployed version can run scheduled sync automatically."
+    )
+
+    if st.button("Run Auto Task Intake"):
+        with st.spinner("Running auto task intake..."):
+            summary = run_auto_task_intake()
+        st.session_state.latest_intake_summary = summary
+        st.success("Auto Task Intake finished.")
+
+    if st.session_state.get("latest_intake_summary"):
+        render_intake_summary(st.session_state.latest_intake_summary)
+
+
+def render_candidate_fields(candidate):
+    columns = st.columns(4)
+    columns[0].markdown(f"**Course**  \n{display_value(candidate['course'])}")
+    columns[1].markdown(f"**Source**  \n{display_value(candidate['source'])}")
+    columns[2].markdown(
+        f"**Confidence**  \n{display_value(candidate['confidence'])}"
+    )
+    columns[3].markdown(f"**Due**  \n{display_value(candidate['due_at'])}")
+
+    columns = st.columns(4)
+    columns[0].markdown(
+        f"**Urgency**  \n{display_value(candidate['urgency_label'])}"
+    )
+    columns[1].markdown(
+        f"**Score**  \n{display_value(candidate['urgency_score'])}"
+    )
+    columns[2].markdown(
+        "**Recommended**  \n"
+        f"{display_value(candidate['recommended_status'])}"
+    )
+    columns[3].markdown(
+        f"**Type**  \n{display_value(candidate['task_type'])}"
+    )
+
+    st.markdown(f"**Notes**  \n{display_value(candidate['notes'])}")
+    if candidate.get("source_url"):
+        st.markdown(f"**Source URL**  \n{candidate['source_url']}")
+
+
+def render_pending_task_candidates():
+    st.markdown("### Pending Task Candidates")
+    candidates = get_pending_task_candidates()
+    if not candidates:
+        st.info("No pending task candidates right now.")
+        return
+
+    for candidate in candidates:
+        with st.container(border=True):
+            st.markdown(f"#### {display_value(candidate['title'])}")
+            render_candidate_fields(candidate)
+
+            columns = st.columns(3)
+            with columns[0]:
+                if st.button(
+                    "Accept as Confirmed",
+                    key=f"candidate-confirmed-{candidate['id']}",
+                ):
+                    task_id = promote_candidate_to_task(
+                        candidate["id"],
+                        status="confirmed",
+                    )
+                    if task_id:
+                        st.success("Candidate accepted as confirmed task.")
+                    else:
+                        st.info(
+                            "Candidate was not promoted, likely because it is "
+                            "not trusted enough or already exists."
+                        )
+                    st.rerun()
+            with columns[1]:
+                if st.button(
+                    "Accept as Suggested",
+                    key=f"candidate-suggested-{candidate['id']}",
+                ):
+                    task_id = promote_candidate_to_task(
+                        candidate["id"],
+                        status="suggested",
+                    )
+                    if task_id:
+                        st.success("Candidate accepted as suggested task.")
+                    else:
+                        st.info("Candidate was not promoted because it already exists.")
+                    st.rerun()
+            with columns[2]:
+                if st.button("Ignore", key=f"candidate-ignore-{candidate['id']}"):
+                    update_task_candidate_decision(candidate["id"], "ignored")
+                    st.success("Candidate ignored.")
+                    st.rerun()
+
+
+def top_urgent_tasks(limit=10):
+    tasks = [
+        task for task in get_all_tasks()
+        if task.get("status") not in ("done", "ignored")
+    ]
+    return sorted(
+        tasks,
+        key=lambda task: (
+            -task_urgency(task)[0],
+            task.get("due_at") or "9999-12-31",
+            -(int(task.get("priority") or 0)),
+            task.get("title") or "",
+        ),
+    )[:limit]
+
+
+def render_top_urgent_tasks():
+    st.markdown("### Top Urgent Tasks")
+    tasks = top_urgent_tasks(limit=10)
+    if not tasks:
+        st.info("No active tasks to score yet.")
+        return
+
+    for task in tasks:
+        urgency_score, urgency_label = task_urgency(task)
+        with st.container(border=True):
+            st.markdown(f"#### {display_value(task['title'])}")
+            columns = st.columns(4)
+            columns[0].markdown(f"**Course**  \n{display_value(task['course'])}")
+            columns[1].markdown(f"**Due**  \n{display_value(task['due_at'])}")
+            columns[2].markdown(
+                f"**Planned**  \n{display_value(task['planned_date'])}"
+            )
+            columns[3].markdown(
+                f"**Priority**  \n{display_value(task['priority'])}"
+            )
+
+            columns = st.columns(3)
+            columns[0].markdown(f"**Status**  \n{display_value(task['status'])}")
+            columns[1].markdown(f"**Urgency**  \n{display_value(urgency_label)}")
+            columns[2].markdown(f"**Score**  \n{urgency_score:.1f}")
+
+
+def render_rescore_tasks():
+    st.markdown("### Rescore Tasks")
+    if st.button("Rescore All Active Tasks"):
+        count = rescore_all_active_tasks()
+        st.success(f"Rescored {count} active tasks.")
+        st.rerun()
+
+
+def render_task_intake():
+    st.subheader("Task Intake")
+    render_task_intake_controls()
+    render_pending_task_candidates()
+    render_top_urgent_tasks()
+    render_rescore_tasks()
 
 
 def task_option_label(task):
@@ -1268,6 +1484,8 @@ def main():
         render_today_plan()
     elif choice == "AI Boss":
         render_ai_boss()
+    elif choice == "Task Intake":
+        render_task_intake()
     elif choice == "Focus Session":
         render_focus_session()
     elif choice == "Daily Review":

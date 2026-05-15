@@ -45,6 +45,10 @@ The app currently supports manual task tracking, syllabus PDF upload, AI-assiste
   - Generates a daily execution briefing from compact local context
   - Reads tasks, Today Plan, focus sessions, daily reviews, and agent memory
   - Saves briefings locally without automatically changing task status
+- Auto Task Intake + urgency scoring
+  - Discovers clear trusted Canvas assignment tasks
+  - Keeps uncertain items in a pending task inbox
+  - Scores active tasks with urgency labels for planning
 - Data retention foundation
   - SQLite backups before schema migrations when practical
   - Raw data preserved for future agent memory
@@ -69,6 +73,8 @@ The app currently supports manual task tracking, syllabus PDF upload, AI-assiste
 - `file_parser.py` - PDF metadata and text extraction
 - `ai_parser.py` - AI syllabus task extraction
 - `ai_boss.py` - AI Boss context building and briefing generation
+- `urgency.py` - rule-based task urgency scoring
+- `task_intake.py` - automatic task candidate normalization and intake
 - `canvas_client.py` - read-only Canvas API client
 - `prompts/ai_boss.md` - AI Boss guardrails and JSON output prompt
 - `docs/agent_memory_plan.md` - future agent memory plan
@@ -128,5 +134,6 @@ Main persisted data:
 - `daily_reviews`
 - `agent_memory`
 - `ai_boss_briefings`
+- `task_candidates`
 
 Future AI memory should summarize patterns from raw data without overwriting raw data.

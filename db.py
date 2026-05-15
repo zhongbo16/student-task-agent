@@ -6,6 +6,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from models import TASK_COLUMNS, VALID_STATUSES, normalize_task
+from urgency import VALID_URGENCY_LABELS
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -28,6 +29,13 @@ VALID_MEMORY_TYPES = (
     "other",
 )
 VALID_MEMORY_CONFIDENCES = ("high", "medium", "low")
+VALID_CANDIDATE_DECISIONS = (
+    "pending",
+    "auto_created",
+    "accepted",
+    "ignored",
+    "duplicate",
+)
 
 
 def _connect():
@@ -38,6 +46,7 @@ def _connect():
 
 def _create_tasks_table(cursor, table_name="tasks"):
     allowed_statuses = "', '".join(VALID_STATUSES)
+    allowed_urgency_labels = "', '".join(VALID_URGENCY_LABELS)
     cursor.execute(f'''
         CREATE TABLE {table_name} (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -62,6 +71,14 @@ def _create_tasks_table(cursor, table_name="tasks"):
             external_id TEXT,
             external_source TEXT,
             external_url TEXT,
+            urgency_score REAL DEFAULT 0,
+            urgency_label TEXT CHECK (
+                urgency_label IS NULL
+                OR urgency_label IN ('{allowed_urgency_labels}')
+            ),
+            auto_created INTEGER DEFAULT 0 CHECK (auto_created IN (0, 1)),
+            needs_review INTEGER DEFAULT 0 CHECK (needs_review IN (0, 1)),
+            last_scored_at TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -154,6 +171,51 @@ def _create_ai_boss_briefings_table(cursor):
     ''')
 
 
+def _create_task_candidates_table(cursor):
+    allowed_confidences = "', '".join(VALID_MEMORY_CONFIDENCES)
+    allowed_urgency_labels = "', '".join(VALID_URGENCY_LABELS)
+    allowed_decisions = "', '".join(VALID_CANDIDATE_DECISIONS)
+    cursor.execute(f'''
+        CREATE TABLE IF NOT EXISTS task_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            candidate_hash TEXT UNIQUE,
+            title TEXT NOT NULL,
+            course TEXT,
+            task_type TEXT,
+            source TEXT,
+            confidence TEXT CHECK (
+                confidence IS NULL
+                OR confidence IN ('{allowed_confidences}')
+            ),
+            due_at TEXT,
+            planned_date TEXT,
+            estimated_minutes INTEGER CHECK (
+                estimated_minutes IS NULL OR estimated_minutes > 0
+            ),
+            priority TEXT,
+            notes TEXT,
+            source_url TEXT,
+            source_snippet TEXT,
+            external_source TEXT,
+            external_id TEXT,
+            urgency_score REAL DEFAULT 0,
+            urgency_label TEXT CHECK (
+                urgency_label IS NULL
+                OR urgency_label IN ('{allowed_urgency_labels}')
+            ),
+            recommended_status TEXT CHECK (
+                recommended_status IS NULL
+                OR recommended_status IN ('suggested', 'confirmed')
+            ),
+            decision_status TEXT DEFAULT 'pending' CHECK (
+                decision_status IN ('{allowed_decisions}')
+            ),
+            created_at TEXT,
+            updated_at TEXT
+        )
+    ''')
+
+
 def _table_columns(cursor, table_name):
     cursor.execute(f"PRAGMA table_info({table_name})")
     return [row["name"] for row in cursor.fetchall()]
@@ -201,11 +263,13 @@ def _database_needs_backup_before_init():
         daily_reviews_missing = not _table_exists(cursor, "daily_reviews")
         agent_memory_missing = not _table_exists(cursor, "agent_memory")
         ai_boss_briefings_missing = not _table_exists(cursor, "ai_boss_briefings")
+        task_candidates_missing = not _table_exists(cursor, "task_candidates")
         return (
             tasks_need_migration
             or daily_reviews_missing
             or agent_memory_missing
             or ai_boss_briefings_missing
+            or task_candidates_missing
         )
 
 
@@ -274,11 +338,37 @@ def _migrate_tasks_table(cursor, existing_columns):
             "THEN confidence ELSE NULL END"
         )
 
+    urgency_score_expr = "0"
+    if "urgency_score" in legacy_columns:
+        urgency_score_expr = "COALESCE(urgency_score, 0)"
+
+    urgency_label_expr = "NULL"
+    if "urgency_label" in legacy_columns:
+        allowed_labels = "', '".join(VALID_URGENCY_LABELS)
+        urgency_label_expr = (
+            f"CASE WHEN urgency_label IN ('{allowed_labels}') "
+            "THEN urgency_label ELSE NULL END"
+        )
+
+    auto_created_expr = "0"
+    if "auto_created" in legacy_columns:
+        auto_created_expr = "CASE WHEN auto_created = 1 THEN 1 ELSE 0 END"
+
+    needs_review_expr = (
+        "CASE WHEN "
+        f"{status_expr} = 'suggested' "
+        "THEN 1 ELSE 0 END"
+    )
+    if "needs_review" in legacy_columns:
+        needs_review_expr = "CASE WHEN needs_review = 1 THEN 1 ELSE 0 END"
+
     cursor.execute(f'''
         INSERT INTO tasks (
             id, title, course, task_type, due_at, planned_date,
             estimated_minutes, priority, status, source, confidence, notes,
             source_snippet, external_id, external_source, external_url,
+            urgency_score, urgency_label, auto_created, needs_review,
+            last_scored_at,
             created_at, updated_at
         )
         SELECT
@@ -298,6 +388,11 @@ def _migrate_tasks_table(cursor, existing_columns):
             {text_expr("external_id")},
             {text_expr("external_source")},
             {text_expr("external_url")},
+            {urgency_score_expr},
+            {urgency_label_expr},
+            {auto_created_expr},
+            {needs_review_expr},
+            {text_expr("last_scored_at")},
             {created_at_expr},
             {updated_at_expr}
         FROM tasks_legacy
@@ -309,6 +404,8 @@ TASK_SELECT = '''
     SELECT id, title, course, task_type, due_at, planned_date,
            estimated_minutes, priority, status, source, confidence, notes,
            source_snippet, external_id, external_source, external_url,
+           urgency_score, urgency_label, auto_created, needs_review,
+           last_scored_at,
            created_at, updated_at
     FROM tasks
 '''
@@ -329,6 +426,36 @@ def _fetch_tasks(where_clause="", params=()):
         return [dict(row) for row in cursor.fetchall()]
 
 
+def add_task_urgency_columns_if_missing(cursor=None):
+    def add_columns(active_cursor):
+        columns = set(_table_columns(active_cursor, "tasks"))
+        if "urgency_score" not in columns:
+            active_cursor.execute(
+                "ALTER TABLE tasks ADD COLUMN urgency_score REAL DEFAULT 0"
+            )
+        if "urgency_label" not in columns:
+            active_cursor.execute("ALTER TABLE tasks ADD COLUMN urgency_label TEXT")
+        if "auto_created" not in columns:
+            active_cursor.execute(
+                "ALTER TABLE tasks ADD COLUMN auto_created INTEGER DEFAULT 0"
+            )
+        if "needs_review" not in columns:
+            active_cursor.execute(
+                "ALTER TABLE tasks ADD COLUMN needs_review INTEGER DEFAULT 0"
+            )
+        if "last_scored_at" not in columns:
+            active_cursor.execute("ALTER TABLE tasks ADD COLUMN last_scored_at TEXT")
+
+    if cursor is not None:
+        add_columns(cursor)
+        return
+
+    with closing(_connect()) as conn:
+        active_cursor = conn.cursor()
+        add_columns(active_cursor)
+        conn.commit()
+
+
 def init_db():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     if _database_needs_backup_before_init():
@@ -340,12 +467,15 @@ def init_db():
             _create_tasks_table(cursor)
         else:
             _migrate_tasks_table(cursor, _table_columns(cursor, "tasks"))
+        add_task_urgency_columns_if_missing(cursor)
         _create_study_sessions_table(cursor)
+        _create_task_candidates_table(cursor)
         conn.commit()
 
     init_daily_reviews_table(create_backup=False)
     init_agent_memory_table(create_backup=False)
     init_ai_boss_briefings_table(create_backup=False)
+    score_unscored_active_tasks()
 
 
 def backup_database():
@@ -419,6 +549,15 @@ def init_ai_boss_briefings_table(create_backup=True):
 def create_task(task):
     task = normalize_task(task)
     now = datetime.now().isoformat(timespec="seconds")
+    if not task.get("urgency_label"):
+        from urgency import calculate_urgency_score
+
+        urgency_score, urgency_label, _ = calculate_urgency_score(task)
+        task["urgency_score"] = urgency_score
+        task["urgency_label"] = urgency_label
+        task["last_scored_at"] = now
+    elif not task.get("last_scored_at"):
+        task["last_scored_at"] = now
 
     with closing(_connect()) as conn:
         cursor = conn.cursor()
@@ -427,8 +566,9 @@ def create_task(task):
                 title, course, task_type, due_at, planned_date,
                 estimated_minutes, priority, status, source, confidence, notes,
                 source_snippet, external_id, external_source, external_url,
-                created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                urgency_score, urgency_label, auto_created, needs_review,
+                last_scored_at, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             task["title"],
             task["course"],
@@ -445,6 +585,11 @@ def create_task(task):
             task["external_id"],
             task["external_source"],
             task["external_url"],
+            task["urgency_score"],
+            task["urgency_label"],
+            task["auto_created"],
+            task["needs_review"],
+            task["last_scored_at"],
             now,
             now,
         ))
@@ -500,14 +645,22 @@ def update_task_status(task_id, status):
         raise ValueError(f"Status must be one of: {', '.join(VALID_STATUSES)}")
 
     now = datetime.now().isoformat(timespec="seconds")
+    needs_review = 1 if status == "suggested" else 0
     with closing(_connect()) as conn:
         cursor = conn.cursor()
         cursor.execute('''
             UPDATE tasks
-            SET status = ?, updated_at = ?
+            SET status = ?, needs_review = ?, updated_at = ?
             WHERE id = ?
-        ''', (status, now, task_id))
+        ''', (status, needs_review, now, task_id))
         conn.commit()
+
+    updated_task = _fetch_tasks("WHERE id = ?", (task_id,))
+    if updated_task:
+        from urgency import calculate_urgency_score
+
+        urgency_score, urgency_label, _ = calculate_urgency_score(updated_task[0])
+        update_task_urgency(task_id, urgency_score, urgency_label)
 
 
 def task_exists_by_external_id(external_source, external_id):
@@ -571,6 +724,8 @@ def create_canvas_assignment_task(assignment):
         "external_id": str(external_id) if external_id is not None else None,
         "external_source": external_source,
         "external_url": external_url,
+        "auto_created": 1,
+        "needs_review": 0,
     })
     return True
 
@@ -1173,6 +1328,387 @@ def get_recent_ai_boss_briefings(limit=7):
                    raw_response, created_at
             FROM ai_boss_briefings
             ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            ''',
+            (limit,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def update_task_urgency(task_id, urgency_score, urgency_label):
+    if urgency_label not in VALID_URGENCY_LABELS:
+        raise ValueError(
+            f"Urgency label must be one of: {', '.join(VALID_URGENCY_LABELS)}."
+        )
+
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            UPDATE tasks
+            SET urgency_score = ?,
+                urgency_label = ?,
+                last_scored_at = ?
+            WHERE id = ?
+            ''',
+            (float(urgency_score), urgency_label, now, task_id),
+        )
+        conn.commit()
+
+
+def rescore_all_active_tasks():
+    from urgency import calculate_urgency_score
+
+    tasks = [
+        task for task in get_all_tasks()
+        if task.get("status") not in ("done", "ignored")
+    ]
+    for task in tasks:
+        urgency_score, urgency_label, _ = calculate_urgency_score(task)
+        update_task_urgency(task["id"], urgency_score, urgency_label)
+    return len(tasks)
+
+
+def score_unscored_active_tasks():
+    from urgency import calculate_urgency_score
+
+    tasks = [
+        task for task in get_all_tasks()
+        if task.get("status") not in ("done", "ignored")
+        and (
+            not task.get("last_scored_at")
+            or not task.get("urgency_label")
+        )
+    ]
+    for task in tasks:
+        urgency_score, urgency_label, _ = calculate_urgency_score(task)
+        update_task_urgency(task["id"], urgency_score, urgency_label)
+    return len(tasks)
+
+
+def _clean_candidate_text(value):
+    if value is None:
+        return None
+
+    text = str(value).strip()
+    return text or None
+
+
+def _clean_candidate_date(value):
+    if value in (None, ""):
+        return None
+
+    if isinstance(value, datetime):
+        return value.date().isoformat()
+
+    if isinstance(value, date):
+        return value.isoformat()
+
+    text = str(value).strip()
+    candidate = text[:10]
+    try:
+        datetime.strptime(candidate, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return candidate
+
+
+def _clean_candidate_minutes(value):
+    if value in (None, ""):
+        return None
+
+    try:
+        minutes = int(value)
+    except (TypeError, ValueError):
+        return None
+
+    return minutes if minutes > 0 else None
+
+
+def _normalize_candidate(candidate):
+    title = _clean_candidate_text(candidate.get("title"))
+    if not title:
+        raise ValueError("Candidate title is required.")
+
+    confidence = _clean_candidate_text(candidate.get("confidence"))
+    if confidence:
+        confidence = confidence.lower()
+        if confidence not in VALID_MEMORY_CONFIDENCES:
+            confidence = "low"
+
+    urgency_label = _clean_candidate_text(candidate.get("urgency_label"))
+    if urgency_label and urgency_label not in VALID_URGENCY_LABELS:
+        urgency_label = None
+
+    decision_status = (
+        _clean_candidate_text(candidate.get("decision_status")) or "pending"
+    )
+    if decision_status not in VALID_CANDIDATE_DECISIONS:
+        decision_status = "pending"
+
+    recommended_status = _clean_candidate_text(candidate.get("recommended_status"))
+    if recommended_status not in ("suggested", "confirmed"):
+        recommended_status = "suggested"
+
+    urgency_score = candidate.get("urgency_score")
+    try:
+        urgency_score = float(urgency_score)
+    except (TypeError, ValueError):
+        urgency_score = 0.0
+
+    return {
+        "candidate_hash": _clean_candidate_text(candidate.get("candidate_hash")),
+        "title": title,
+        "course": _clean_candidate_text(candidate.get("course")),
+        "task_type": _clean_candidate_text(candidate.get("task_type")),
+        "source": _clean_candidate_text(candidate.get("source")),
+        "confidence": confidence,
+        "due_at": _clean_candidate_date(candidate.get("due_at")),
+        "planned_date": _clean_candidate_date(candidate.get("planned_date")),
+        "estimated_minutes": _clean_candidate_minutes(
+            candidate.get("estimated_minutes")
+        ),
+        "priority": _clean_candidate_text(candidate.get("priority")),
+        "notes": _clean_candidate_text(candidate.get("notes")),
+        "source_url": _clean_candidate_text(candidate.get("source_url")),
+        "source_snippet": _clean_candidate_text(candidate.get("source_snippet")),
+        "external_source": _clean_candidate_text(candidate.get("external_source")),
+        "external_id": _clean_candidate_text(candidate.get("external_id")),
+        "urgency_score": urgency_score,
+        "urgency_label": urgency_label,
+        "recommended_status": recommended_status,
+        "decision_status": decision_status,
+    }
+
+
+def create_task_candidate(candidate):
+    candidate = _normalize_candidate(candidate)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT OR IGNORE INTO task_candidates (
+                candidate_hash, title, course, task_type, source, confidence,
+                due_at, planned_date, estimated_minutes, priority, notes,
+                source_url, source_snippet, external_source, external_id,
+                urgency_score, urgency_label, recommended_status,
+                decision_status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                candidate["candidate_hash"],
+                candidate["title"],
+                candidate["course"],
+                candidate["task_type"],
+                candidate["source"],
+                candidate["confidence"],
+                candidate["due_at"],
+                candidate["planned_date"],
+                candidate["estimated_minutes"],
+                candidate["priority"],
+                candidate["notes"],
+                candidate["source_url"],
+                candidate["source_snippet"],
+                candidate["external_source"],
+                candidate["external_id"],
+                candidate["urgency_score"],
+                candidate["urgency_label"],
+                candidate["recommended_status"],
+                candidate["decision_status"],
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        if cursor.rowcount == 0:
+            return None
+        return cursor.lastrowid
+
+
+def _fetch_task_candidates(where_clause="", params=()):
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f'''
+            SELECT id, candidate_hash, title, course, task_type, source,
+                   confidence, due_at, planned_date, estimated_minutes,
+                   priority, notes, source_url, source_snippet, external_source,
+                   external_id, urgency_score, urgency_label,
+                   recommended_status, decision_status, created_at, updated_at
+            FROM task_candidates
+            {where_clause}
+            ''',
+            params,
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_pending_task_candidates():
+    return _fetch_task_candidates(
+        '''
+        WHERE decision_status = 'pending'
+        ORDER BY urgency_score DESC, due_at ASC, created_at DESC
+        '''
+    )
+
+
+def get_task_candidate(candidate_id):
+    candidates = _fetch_task_candidates("WHERE id = ? LIMIT 1", (candidate_id,))
+    return candidates[0] if candidates else None
+
+
+def update_task_candidate_decision(candidate_id, decision_status):
+    if decision_status not in VALID_CANDIDATE_DECISIONS:
+        raise ValueError(
+            "Candidate decision must be one of: "
+            f"{', '.join(VALID_CANDIDATE_DECISIONS)}."
+        )
+
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            UPDATE task_candidates
+            SET decision_status = ?, updated_at = ?
+            WHERE id = ?
+            ''',
+            (decision_status, now, candidate_id),
+        )
+        conn.commit()
+
+
+def task_exists_by_signature(source, title, course=None, due_at=None):
+    title = _clean_candidate_text(title)
+    if not title:
+        return False
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT 1
+            FROM tasks
+            WHERE COALESCE(source, '') = COALESCE(?, '')
+              AND LOWER(TRIM(title)) = LOWER(TRIM(?))
+              AND COALESCE(course, '') = COALESCE(?, '')
+              AND COALESCE(due_at, '') = COALESCE(?, '')
+            LIMIT 1
+            ''',
+            (
+                _clean_candidate_text(source),
+                title,
+                _clean_candidate_text(course) or "",
+                _clean_candidate_date(due_at) or "",
+            ),
+        )
+        return cursor.fetchone() is not None
+
+
+def _candidate_priority_for_task(value):
+    if value in (None, ""):
+        return 3
+
+    if isinstance(value, str):
+        priority_map = {
+            "highest": 5,
+            "high": 5,
+            "medium": 3,
+            "normal": 3,
+            "low": 1,
+            "lowest": 1,
+        }
+        mapped = priority_map.get(value.strip().lower())
+        if mapped:
+            return mapped
+
+    try:
+        return max(1, min(5, int(value)))
+    except (TypeError, ValueError):
+        return 3
+
+
+def promote_candidate_to_task(candidate_id, status="suggested"):
+    candidate = get_task_candidate(candidate_id)
+    if not candidate:
+        return None
+
+    if status == "confirmed" and candidate.get("recommended_status") != "confirmed":
+        status = "suggested"
+    if status not in ("suggested", "confirmed"):
+        status = "suggested"
+
+    if (
+        candidate.get("external_source")
+        and candidate.get("external_id")
+        and task_exists_by_external_id(
+            candidate["external_source"],
+            candidate["external_id"],
+        )
+    ):
+        update_task_candidate_decision(candidate_id, "duplicate")
+        return None
+
+    if task_exists_by_signature(
+        candidate.get("source"),
+        candidate.get("title"),
+        candidate.get("course"),
+        candidate.get("due_at"),
+    ):
+        update_task_candidate_decision(candidate_id, "duplicate")
+        return None
+
+    notes = candidate.get("notes")
+    if candidate.get("source_url"):
+        url_note = f"Source: {candidate['source_url']}"
+        notes = f"{notes}\n{url_note}" if notes else url_note
+
+    task_id = create_task({
+        "title": candidate["title"],
+        "course": candidate.get("course"),
+        "task_type": candidate.get("task_type"),
+        "due_at": candidate.get("due_at"),
+        "planned_date": candidate.get("planned_date"),
+        "estimated_minutes": candidate.get("estimated_minutes"),
+        "priority": _candidate_priority_for_task(candidate.get("priority")),
+        "status": status,
+        "source": candidate.get("source") or "task_intake",
+        "confidence": candidate.get("confidence"),
+        "notes": notes,
+        "source_snippet": candidate.get("source_snippet"),
+        "external_id": candidate.get("external_id"),
+        "external_source": candidate.get("external_source"),
+        "external_url": candidate.get("source_url"),
+        "urgency_score": candidate.get("urgency_score") or 0,
+        "urgency_label": candidate.get("urgency_label"),
+        "auto_created": 1 if status == "confirmed" else 0,
+        "needs_review": 1 if status == "suggested" else 0,
+    })
+    update_task_candidate_decision(
+        candidate_id,
+        "auto_created" if status == "confirmed" else "accepted",
+    )
+    return task_id
+
+
+def get_recent_quercus_items(limit=100):
+    limit = max(1, int(limit))
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        if not _table_exists(cursor, "quercus_items"):
+            return []
+
+        cursor.execute(
+            '''
+            SELECT id, external_id, external_source, course_id, course_name,
+                   item_type, title, body_text, url, due_at, posted_at,
+                   workflow_state, raw_json, created_at, updated_at,
+                   last_seen_at
+            FROM quercus_items
+            ORDER BY last_seen_at DESC, updated_at DESC, id DESC
             LIMIT ?
             ''',
             (limit,),

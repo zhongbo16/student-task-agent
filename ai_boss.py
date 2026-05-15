@@ -12,6 +12,7 @@ from planner import (
     parse_task_date,
     priority_score,
 )
+from urgency import calculate_urgency_score
 
 BASE_DIR = Path(__file__).resolve().parent
 PROMPT_PATH = BASE_DIR / "prompts" / "ai_boss.md"
@@ -119,6 +120,10 @@ def _date_label(task, current_date):
 
 def _compact_task(task, current_date):
     task_id = task.get("id")
+    urgency_score, urgency_label, urgency_reasons = calculate_urgency_score(
+        task,
+        current_date,
+    )
     return {
         "id": str(task_id) if task_id is not None else None,
         "title": _truncate(task.get("title"), 220),
@@ -132,6 +137,9 @@ def _compact_task(task, current_date):
         "date_label": _date_label(task, current_date),
         "estimated_minutes": estimated_minutes(task),
         "priority": priority_score(task) or None,
+        "urgency_score": task.get("urgency_score") or urgency_score,
+        "urgency_label": task.get("urgency_label") or urgency_label,
+        "urgency_reasons": urgency_reasons[:6],
         "notes": _truncate(task.get("notes"), 260),
         "updated_at": task.get("updated_at"),
     }
