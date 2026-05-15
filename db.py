@@ -444,6 +444,21 @@ def _create_command_center_messages_table(cursor):
     ''')
 
 
+def _create_daily_refresh_runs_table(cursor):
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS daily_refresh_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            refresh_date TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            trigger_source TEXT,
+            summary_json TEXT,
+            errors_json TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+    ''')
+
+
 def _table_columns(cursor, table_name):
     cursor.execute(f"PRAGMA table_info({table_name})")
     return [row["name"] for row in cursor.fetchall()]
@@ -513,6 +528,10 @@ def _database_needs_backup_before_init():
             cursor,
             "command_center_messages",
         )
+        daily_refresh_runs_missing = not _table_exists(
+            cursor,
+            "daily_refresh_runs",
+        )
         return (
             tasks_need_migration
             or daily_reviews_missing
@@ -528,6 +547,7 @@ def _database_needs_backup_before_init():
             or agent_memory_candidates_missing
             or checkin_answers_missing
             or command_center_messages_missing
+            or daily_refresh_runs_missing
         )
 
 
@@ -793,6 +813,7 @@ def init_db():
         _create_agent_memory_candidates_table(cursor)
         _create_checkin_answers_table(cursor)
         _create_command_center_messages_table(cursor)
+        _create_daily_refresh_runs_table(cursor)
         conn.commit()
 
     init_daily_reviews_table(create_backup=False)
@@ -806,6 +827,7 @@ def init_db():
     init_agent_memory_candidates_table(create_backup=False)
     init_checkin_answers_table(create_backup=False)
     init_command_center_messages_table(create_backup=False)
+    init_daily_refresh_runs_table(create_backup=False)
     score_unscored_active_tasks()
 
 
@@ -1018,6 +1040,24 @@ def init_command_center_messages_table(create_backup=True):
     with closing(_connect()) as conn:
         cursor = conn.cursor()
         _create_command_center_messages_table(cursor)
+        conn.commit()
+
+
+def init_daily_refresh_runs_table(create_backup=True):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+
+    missing = True
+    if DB_PATH.exists():
+        with closing(_connect()) as conn:
+            cursor = conn.cursor()
+            missing = not _table_exists(cursor, "daily_refresh_runs")
+
+    if missing and create_backup:
+        backup_database()
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        _create_daily_refresh_runs_table(cursor)
         conn.commit()
 
 
@@ -2266,6 +2306,79 @@ def get_recent_command_center_messages(message_date=None, limit=20):
             LIMIT ?
             ''',
             (*params, limit),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def create_or_update_daily_refresh_run(refresh):
+    refresh_date = _clean_review_date(refresh.get("refresh_date"))
+    status = _clean_review_text(refresh.get("status")) or "completed"
+    trigger_source = _clean_review_text(refresh.get("trigger_source")) or "manual"
+    summary = refresh.get("summary") or {}
+    errors = refresh.get("errors") or []
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO daily_refresh_runs (
+                refresh_date, status, trigger_source, summary_json,
+                errors_json, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(refresh_date) DO UPDATE SET
+                status = excluded.status,
+                trigger_source = excluded.trigger_source,
+                summary_json = excluded.summary_json,
+                errors_json = excluded.errors_json,
+                updated_at = excluded.updated_at
+            ''',
+            (
+                refresh_date,
+                status,
+                trigger_source,
+                json.dumps(summary, ensure_ascii=False),
+                json.dumps(errors, ensure_ascii=False),
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+
+    return get_daily_refresh_run_by_date(refresh_date)
+
+
+def get_daily_refresh_run_by_date(refresh_date):
+    refresh_date = _clean_review_date(refresh_date)
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, refresh_date, status, trigger_source, summary_json,
+                   errors_json, created_at, updated_at
+            FROM daily_refresh_runs
+            WHERE refresh_date = ?
+            LIMIT 1
+            ''',
+            (refresh_date,),
+        )
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def get_recent_daily_refresh_runs(limit=7):
+    limit = max(1, int(limit))
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, refresh_date, status, trigger_source, summary_json,
+                   errors_json, created_at, updated_at
+            FROM daily_refresh_runs
+            ORDER BY refresh_date DESC, updated_at DESC
+            LIMIT ?
+            ''',
+            (limit,),
         )
         return [dict(row) for row in cursor.fetchall()]
 

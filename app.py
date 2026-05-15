@@ -1,6 +1,7 @@
 import hashlib
 import html
 import json
+import os
 import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -59,6 +60,7 @@ from db import (
     create_command_center_message,
     create_or_update_morning_checkin,
     create_or_update_behavior_plan,
+    create_or_update_daily_refresh_run,
     create_or_update_daily_review,
     create_personal_commitment,
     create_task,
@@ -72,6 +74,7 @@ from db import (
     get_checkin_answers_by_date,
     get_daily_review_by_date,
     get_daily_command_review_by_command,
+    get_daily_refresh_run_by_date,
     get_latest_daily_command,
     get_latest_ai_boss_briefing,
     get_behavior_plan_by_date,
@@ -1882,6 +1885,7 @@ def render_command_center_top_tasks(tasks):
     active_session = get_active_study_session()
 
     render_command_hero(command, behavior_plan, top_tasks, active_session)
+    render_daily_refresh_status()
     render_minimum_viable_day(behavior_plan)
 
     avoidance_warning = None
@@ -3013,6 +3017,131 @@ def render_intake_summary(summary):
             st.warning(error)
 
 
+def parse_refresh_json(value, default):
+    if not value:
+        return default
+    try:
+        parsed = json.loads(value)
+    except json.JSONDecodeError:
+        return default
+    return parsed
+
+
+def daily_refresh_status_label(record):
+    if not record:
+        return "Not synced today"
+    status = record.get("status") or "-"
+    updated_at = display_datetime(record.get("updated_at"))
+    return f"{status} at {updated_at}"
+
+
+def run_daily_quercus_refresh(trigger_source="manual"):
+    refresh_date = date.today().isoformat()
+    if not (has_canvas_base_url() and has_canvas_api_token()):
+        return create_or_update_daily_refresh_run({
+            "refresh_date": refresh_date,
+            "status": "skipped",
+            "trigger_source": trigger_source,
+            "summary": {
+                "message": "Canvas credentials are not configured.",
+            },
+            "errors": [
+                "Add CANVAS_BASE_URL and CANVAS_API_TOKEN to .env to enable daily refresh."
+            ],
+        })
+
+    try:
+        summary = run_auto_task_intake()
+        cleanup = ignore_past_quercus_intake_items(date.today())
+        summary["past_quercus_cleanup"] = cleanup
+        errors = summary.get("errors") or []
+        status = "completed" if not errors else "completed_with_warnings"
+    except Exception as error:
+        summary = {}
+        errors = [str(error)]
+        status = "failed"
+
+    return create_or_update_daily_refresh_run({
+        "refresh_date": refresh_date,
+        "status": status,
+        "trigger_source": trigger_source,
+        "summary": summary,
+        "errors": errors,
+    })
+
+
+def maybe_run_daily_quercus_refresh():
+    if os.environ.get("STUDENT_TASK_AGENT_DISABLE_AUTO_REFRESH") == "1":
+        return
+
+    refresh_date = date.today().isoformat()
+    session_key = f"daily_refresh_checked_{refresh_date}"
+    if st.session_state.get(session_key):
+        return
+
+    st.session_state[session_key] = True
+    if not (has_canvas_base_url() and has_canvas_api_token()):
+        return
+    if get_daily_refresh_run_by_date(refresh_date):
+        return
+
+    with st.spinner("Refreshing Quercus assignments for today..."):
+        run_daily_quercus_refresh(trigger_source="auto_app_start")
+
+
+def render_daily_refresh_status():
+    refresh_date = date.today().isoformat()
+    record = get_daily_refresh_run_by_date(refresh_date)
+
+    with st.expander("Quercus Refresh", expanded=False):
+        st.caption(
+            "Runs at most once per day when the app opens. It reads Quercus, "
+            "runs Auto Task Intake, skips old due dates, prevents duplicates, "
+            "and rescales urgency. It never writes to Quercus."
+        )
+
+        columns = st.columns(3)
+        columns[0].markdown(
+            f"**Canvas URL**  \n{'Configured' if has_canvas_base_url() else 'Missing'}"
+        )
+        columns[1].markdown(
+            f"**Canvas Token**  \n{'Present' if has_canvas_api_token() else 'Missing'}"
+        )
+        columns[2].markdown(f"**Today**  \n{daily_refresh_status_label(record)}")
+
+        if record:
+            summary = parse_refresh_json(record.get("summary_json"), {})
+            errors = parse_refresh_json(record.get("errors_json"), [])
+            if summary:
+                st.markdown("**Latest summary**")
+                summary_columns = st.columns(4)
+                summary_columns[0].metric(
+                    "Confirmed",
+                    summary.get("confirmed_tasks_auto_created", 0),
+                )
+                summary_columns[1].metric(
+                    "Pending",
+                    summary.get("pending_candidates_created", 0),
+                )
+                summary_columns[2].metric(
+                    "Duplicates",
+                    summary.get("duplicates_skipped", 0),
+                )
+                summary_columns[3].metric(
+                    "Rescored",
+                    summary.get("tasks_rescored", 0),
+                )
+            for error in errors:
+                st.warning(error)
+
+        disabled = not (has_canvas_base_url() and has_canvas_api_token())
+        if st.button("Sync Now", disabled=disabled):
+            with st.spinner("Refreshing Quercus and task intake..."):
+                run_daily_quercus_refresh(trigger_source="manual")
+            st.success("Daily refresh finished.")
+            st.rerun()
+
+
 def render_task_intake_controls():
     st.markdown("### Auto Intake Controls")
     st.info(
@@ -3901,6 +4030,7 @@ def main():
     st.title("Student Task Manager")
 
     init_db()
+    maybe_run_daily_quercus_refresh()
     show_pending_message()
 
     choice = st.sidebar.radio("Menu", MAIN_MENU_OPTIONS, label_visibility="collapsed")
