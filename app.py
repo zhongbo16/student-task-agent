@@ -1,3 +1,6 @@
+import re
+from pathlib import Path
+
 import streamlit as st
 
 from db import (
@@ -9,7 +12,11 @@ from db import (
     init_db,
     update_task_status,
 )
+from file_parser import extract_text_from_pdf, get_file_metadata
 from planner import generate_today_plan, sort_tasks_for_dashboard, task_indicators
+
+BASE_DIR = Path(__file__).resolve().parent
+UPLOAD_DIR = BASE_DIR / "uploads"
 
 MENU_OPTIONS = [
     "Today Plan",
@@ -19,6 +26,7 @@ MENU_OPTIONS = [
     "Suggested Tasks",
     "In Progress",
     "Completed",
+    "Files / Syllabus Upload",
     "Add Task",
     "All Tasks",
 ]
@@ -54,6 +62,14 @@ def display_date(task):
     if task.get("planned_date"):
         return f"Planned: {task['planned_date']}"
     return "No date"
+
+
+def safe_filename(filename):
+    name = Path(filename).name
+    safe_name = re.sub(r"[^A-Za-z0-9._-]", "_", name)
+    if safe_name in ("", ".", ".."):
+        return "uploaded.pdf"
+    return safe_name
 
 
 def view_key(view_name):
@@ -210,6 +226,38 @@ def render_today_plan():
             st.markdown(f"**Reason:** {recommendation['reason']}")
 
 
+def render_file_upload():
+    st.subheader("Files / Syllabus Upload")
+    uploaded_file = st.file_uploader("Upload a PDF", type=["pdf"])
+
+    if uploaded_file is None:
+        st.info("Upload a syllabus or course PDF to preview its extracted text.")
+        return
+
+    UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    saved_path = UPLOAD_DIR / safe_filename(uploaded_file.name)
+    saved_path.write_bytes(uploaded_file.getbuffer())
+
+    try:
+        metadata = get_file_metadata(saved_path)
+        extracted_text = extract_text_from_pdf(saved_path)
+    except Exception as error:
+        st.error(f"Could not read this PDF: {error}")
+        return
+
+    preview = extracted_text[:3000]
+
+    st.success("PDF uploaded successfully.")
+    st.markdown(f"**Filename:** {metadata['filename']}")
+    st.markdown(f"**File size:** {metadata['file_size']:,} bytes")
+    st.markdown(f"**Pages:** {metadata['page_count']}")
+    st.text_area(
+        "Extracted text preview",
+        value=preview or "No extractable text found in this PDF.",
+        height=300,
+    )
+
+
 def main():
     st.title("Student Task Manager")
 
@@ -220,6 +268,8 @@ def main():
 
     if choice == "Today Plan":
         render_today_plan()
+    elif choice == "Files / Syllabus Upload":
+        render_file_upload()
     elif choice == "Add Task":
         render_add_task_form()
     else:
