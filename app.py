@@ -5,8 +5,15 @@ from pathlib import Path
 import streamlit as st
 
 from ai_parser import extract_tasks_from_text
+from canvas_client import (
+    get_all_assignments,
+    get_canvas_base_url,
+    has_canvas_api_token,
+    has_canvas_base_url,
+)
 from db import (
     create_task,
+    create_canvas_assignment_task,
     get_all_tasks,
     get_tasks_by_status,
     get_this_week_tasks,
@@ -29,6 +36,7 @@ MENU_OPTIONS = [
     "In Progress",
     "Completed",
     "Files / Syllabus Upload",
+    "Quercus Sync",
     "Add Task",
     "All Tasks",
 ]
@@ -363,6 +371,65 @@ def render_file_upload():
         )
 
 
+def render_quercus_sync():
+    st.subheader("Quercus Sync")
+    st.info(
+        "This sync is read-only. It imports assignments from Quercus/Canvas "
+        "into your local task database."
+    )
+
+    base_url_configured = has_canvas_base_url()
+    token_present = has_canvas_api_token()
+    base_url = get_canvas_base_url()
+
+    st.markdown(
+        f"**CANVAS_BASE_URL configured:** "
+        f"{'Yes' if base_url_configured else 'No'}"
+    )
+    if base_url_configured:
+        st.markdown(f"**Canvas base URL:** {base_url}")
+    st.markdown(f"**CANVAS_API_TOKEN present:** {'Yes' if token_present else 'No'}")
+
+    if not base_url_configured:
+        st.warning("Add CANVAS_BASE_URL to your .env file before syncing.")
+    if not token_present:
+        st.warning(
+            "Add CANVAS_API_TOKEN to your .env file before syncing. "
+            "The token is used only for read-only Canvas API requests."
+        )
+
+    if st.button(
+        "Sync Assignments",
+        disabled=not (base_url_configured and token_present),
+    ):
+        with st.spinner("Fetching assignments from Quercus/Canvas..."):
+            assignments, summary = get_all_assignments()
+
+        new_tasks_created = 0
+        duplicates_skipped = 0
+        for assignment in assignments:
+            if create_canvas_assignment_task(assignment):
+                new_tasks_created += 1
+            else:
+                duplicates_skipped += 1
+
+        st.markdown("### Sync Summary")
+        st.markdown(f"**Courses found:** {summary['courses_found']}")
+        st.markdown(f"**Assignments found:** {summary['assignments_found']}")
+        st.markdown(f"**New tasks created:** {new_tasks_created}")
+        st.markdown(f"**Duplicates skipped:** {duplicates_skipped}")
+
+        if summary["errors"]:
+            for error in summary["errors"]:
+                st.error(error)
+        elif summary["assignments_found"] == 0:
+            st.info(
+                "No assignments were found for the active courses returned by Canvas."
+            )
+        else:
+            st.success("Quercus/Canvas assignment sync finished.")
+
+
 def main():
     st.title("Student Task Manager")
 
@@ -375,6 +442,8 @@ def main():
         render_today_plan()
     elif choice == "Files / Syllabus Upload":
         render_file_upload()
+    elif choice == "Quercus Sync":
+        render_quercus_sync()
     elif choice == "Add Task":
         render_add_task_form()
     else:

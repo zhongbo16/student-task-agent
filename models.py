@@ -19,6 +19,9 @@ TASK_COLUMNS = (
     "confidence",
     "notes",
     "source_snippet",
+    "external_id",
+    "external_source",
+    "external_url",
     "created_at",
     "updated_at",
 )
@@ -38,6 +41,9 @@ class Task:
     confidence: Optional[str] = None
     notes: Optional[str] = None
     source_snippet: Optional[str] = None
+    external_id: Optional[str] = None
+    external_source: Optional[str] = None
+    external_url: Optional[str] = None
 
 
 def _clean_text(value):
@@ -105,4 +111,7 @@ def normalize_task(task):
         "confidence": confidence,
         "notes": _clean_text(task.get("notes")),
         "source_snippet": _clean_text(task.get("source_snippet")),
+        "external_id": _clean_text(task.get("external_id")),
+        "external_source": _clean_text(task.get("external_source")),
+        "external_url": _clean_text(task.get("external_url")),
     }

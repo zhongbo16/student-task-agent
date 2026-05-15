@@ -39,6 +39,9 @@ def _create_tasks_table(cursor, table_name="tasks"):
             ),
             notes TEXT,
             source_snippet TEXT,
+            external_id TEXT,
+            external_source TEXT,
+            external_url TEXT,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL
         )
@@ -144,7 +147,8 @@ def _migrate_tasks_table(cursor, existing_columns):
         INSERT INTO tasks (
             id, title, course, task_type, due_at, planned_date,
             estimated_minutes, priority, status, source, confidence, notes,
-            source_snippet, created_at, updated_at
+            source_snippet, external_id, external_source, external_url,
+            created_at, updated_at
         )
         SELECT
             {id_expr},
@@ -160,6 +164,9 @@ def _migrate_tasks_table(cursor, existing_columns):
             {confidence_expr},
             {text_expr("notes")},
             {text_expr("source_snippet")},
+            {text_expr("external_id")},
+            {text_expr("external_source")},
+            {text_expr("external_url")},
             {created_at_expr},
             {updated_at_expr}
         FROM tasks_legacy
@@ -170,7 +177,8 @@ def _migrate_tasks_table(cursor, existing_columns):
 TASK_SELECT = '''
     SELECT id, title, course, task_type, due_at, planned_date,
            estimated_minutes, priority, status, source, confidence, notes,
-           source_snippet, created_at, updated_at
+           source_snippet, external_id, external_source, external_url,
+           created_at, updated_at
     FROM tasks
 '''
 
@@ -212,8 +220,9 @@ def create_task(task):
             INSERT INTO tasks (
                 title, course, task_type, due_at, planned_date,
                 estimated_minutes, priority, status, source, confidence, notes,
-                source_snippet, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                source_snippet, external_id, external_source, external_url,
+                created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             task["title"],
             task["course"],
@@ -227,6 +236,9 @@ def create_task(task):
             task["confidence"],
             task["notes"],
             task["source_snippet"],
+            task["external_id"],
+            task["external_source"],
+            task["external_url"],
             now,
             now,
         ))
@@ -290,6 +302,71 @@ def update_task_status(task_id, status):
             WHERE id = ?
         ''', (status, now, task_id))
         conn.commit()
+
+
+def task_exists_by_external_id(external_source, external_id):
+    if not external_source or not external_id:
+        return False
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT 1
+            FROM tasks
+            WHERE external_source = ? AND external_id = ?
+            LIMIT 1
+            ''',
+            (str(external_source), str(external_id)),
+        )
+        return cursor.fetchone() is not None
+
+
+def _canvas_due_date(value):
+    if not value:
+        return None
+
+    text = str(value).strip()
+    candidate = text[:10]
+    try:
+        datetime.strptime(candidate, "%Y-%m-%d")
+    except ValueError:
+        return None
+    return candidate
+
+
+def create_canvas_assignment_task(assignment):
+    external_source = assignment.get("external_source") or "canvas_assignment"
+    external_id = assignment.get("external_id")
+    if not external_id:
+        return False
+
+    if task_exists_by_external_id(external_source, external_id):
+        return False
+
+    external_url = assignment.get("external_url")
+    notes = "Imported from Quercus/Canvas."
+    if external_url:
+        notes = f"{notes} Link: {external_url}"
+
+    create_task({
+        "title": assignment.get("title") or "Untitled Canvas assignment",
+        "course": assignment.get("course_name"),
+        "task_type": "assignment",
+        "due_at": _canvas_due_date(assignment.get("due_at")),
+        "planned_date": None,
+        "estimated_minutes": None,
+        "priority": 3,
+        "status": "confirmed",
+        "source": "quercus_assignment",
+        "confidence": "high",
+        "notes": notes,
+        "source_snippet": None,
+        "external_id": str(external_id) if external_id is not None else None,
+        "external_source": external_source,
+        "external_url": external_url,
+    })
+    return True
 
 
 def delete_task(task_id):
