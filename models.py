@@ -1,9 +1,11 @@
 from dataclasses import dataclass
 from datetime import date, datetime
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 VALID_STATUSES = ("suggested", "confirmed", "ignored", "in_progress", "done")
 VALID_CONFIDENCES = ("high", "medium", "low")
+LOCAL_TIMEZONE = ZoneInfo("America/Toronto")
 
 TASK_COLUMNS = (
     "id",
@@ -85,14 +87,35 @@ def _clean_date(value):
         return None
 
     if isinstance(value, datetime):
-        return value.date().isoformat()
+        parsed = value
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(LOCAL_TIMEZONE)
+        if parsed.hour or parsed.minute:
+            return parsed.strftime("%Y-%m-%d %H:%M")
+        return parsed.date().isoformat()
 
     if isinstance(value, date):
         return value.isoformat()
 
     text = str(value).strip()
-    datetime.strptime(text, "%Y-%m-%d")
-    return text
+    if not text:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+
+    if parsed is not None:
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(LOCAL_TIMEZONE)
+        if parsed.hour or parsed.minute:
+            return parsed.strftime("%Y-%m-%d %H:%M")
+        return parsed.date().isoformat()
+
+    candidate = text[:10]
+    datetime.strptime(candidate, "%Y-%m-%d")
+    return candidate
 
 
 def normalize_task(task):

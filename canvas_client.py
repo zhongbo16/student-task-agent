@@ -1,10 +1,13 @@
 import os
+from datetime import datetime
 from pathlib import Path
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 import requests
 
 BASE_DIR = Path(__file__).resolve().parent
+LOCAL_TIMEZONE = ZoneInfo("America/Toronto")
 
 
 class CanvasConfigError(RuntimeError):
@@ -167,6 +170,27 @@ def _course_name(course):
     )
 
 
+def _local_canvas_datetime(value):
+    if not value:
+        return None
+
+    text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return text
+
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(LOCAL_TIMEZONE)
+
+    if parsed.hour or parsed.minute:
+        return parsed.strftime("%Y-%m-%d %H:%M")
+    return parsed.date().isoformat()
+
+
 def _normalize_assignment(assignment, course):
     assignment_id = assignment.get("id")
     return {
@@ -176,7 +200,7 @@ def _normalize_assignment(assignment, course):
         "course_id": str(course.get("id")),
         "course_name": _course_name(course),
         "title": assignment.get("name") or "Untitled Canvas assignment",
-        "due_at": assignment.get("due_at"),
+        "due_at": _local_canvas_datetime(assignment.get("due_at")),
         "description": assignment.get("description"),
     }
 

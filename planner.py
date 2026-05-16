@@ -16,8 +16,8 @@ def parse_task_date(value):
         return value
 
     try:
-        return datetime.strptime(str(value), "%Y-%m-%d").date()
-    except ValueError:
+        return datetime.strptime(str(value).strip()[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
         return None
 
 

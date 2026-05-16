@@ -1,5 +1,6 @@
 import hashlib
 from datetime import date, datetime
+from zoneinfo import ZoneInfo
 
 from canvas_client import (
     CanvasAPIError,
@@ -14,6 +15,7 @@ from db import (
     is_course_archived,
     promote_candidate_to_task,
     rescore_all_active_tasks,
+    update_task_from_external_candidate,
 )
 from urgency import calculate_urgency_score
 
@@ -22,6 +24,7 @@ TRUSTED_CONFIRMED_SOURCES = {
     "quercus_calendar",
     "quercus_upcoming",
 }
+LOCAL_TIMEZONE = ZoneInfo("America/Toronto")
 
 
 def _clean_text(value):
@@ -37,12 +40,32 @@ def _clean_date(value):
         return None
 
     if isinstance(value, datetime):
-        return value.date().isoformat()
+        parsed = value
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(LOCAL_TIMEZONE)
+        if parsed.hour or parsed.minute:
+            return parsed.strftime("%Y-%m-%d %H:%M")
+        return parsed.date().isoformat()
 
     if isinstance(value, date):
         return value.isoformat()
 
     text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+
+    if parsed is not None:
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(LOCAL_TIMEZONE)
+        if parsed.hour or parsed.minute:
+            return parsed.strftime("%Y-%m-%d %H:%M")
+        return parsed.date().isoformat()
+
     candidate = text[:10]
     try:
         datetime.strptime(candidate, "%Y-%m-%d")
@@ -55,7 +78,7 @@ def _date_value(value):
     cleaned = _clean_date(value)
     if not cleaned:
         return None
-    return datetime.strptime(cleaned, "%Y-%m-%d").date()
+    return datetime.strptime(cleaned[:10], "%Y-%m-%d").date()
 
 
 def _is_past_due(candidate, today=None):
@@ -194,6 +217,7 @@ def _empty_summary():
         "duplicates_skipped": 0,
         "skipped_archived_course": 0,
         "skipped_past_due": 0,
+        "tasks_updated": 0,
         "tasks_rescored": 0,
         "errors": [],
     }
@@ -207,6 +231,12 @@ def _handle_candidate(candidate, summary):
 
     if _is_past_due(candidate):
         summary["skipped_past_due"] += 1
+        return
+
+    updated_existing = update_task_from_external_candidate(candidate)
+    if updated_existing:
+        summary["tasks_updated"] += updated_existing
+        summary["duplicates_skipped"] += updated_existing
         return
 
     candidate_id = create_task_candidate(candidate)

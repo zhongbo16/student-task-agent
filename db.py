@@ -6,6 +6,7 @@ import sqlite3
 from contextlib import closing
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 from models import TASK_COLUMNS, VALID_STATUSES, normalize_task
 from urgency import VALID_URGENCY_LABELS
@@ -55,6 +56,7 @@ VALID_BEHAVIOR_ENERGY_LEVELS = ("low", "medium", "high")
 VALID_COGNITIVE_LOADS = ("shallow", "medium", "deep")
 VALID_BEHAVIOR_FRICTIONS = ("low", "medium", "high")
 VALID_AVOIDANCE_RISKS = ("low", "medium", "high", "unknown")
+LOCAL_TIMEZONE = ZoneInfo("America/Toronto")
 
 
 def _connect():
@@ -1129,9 +1131,9 @@ def get_today_tasks():
         '''
         WHERE status NOT IN ('done', 'ignored')
           AND (
-              due_at = ?
-              OR planned_date = ?
-              OR (due_at IS NOT NULL AND due_at < ?)
+              substr(due_at, 1, 10) = ?
+              OR substr(planned_date, 1, 10) = ?
+              OR (due_at IS NOT NULL AND substr(due_at, 1, 10) < ?)
           )
         ''',
         (today, today, today),
@@ -1147,8 +1149,8 @@ def get_this_week_tasks():
         '''
         WHERE status NOT IN ('done', 'ignored')
           AND (
-              (due_at IS NOT NULL AND due_at BETWEEN ? AND ?)
-              OR (planned_date IS NOT NULL AND planned_date BETWEEN ? AND ?)
+              (due_at IS NOT NULL AND substr(due_at, 1, 10) BETWEEN ? AND ?)
+              OR (planned_date IS NOT NULL AND substr(planned_date, 1, 10) BETWEEN ? AND ?)
           )
         ''',
         (start_date, end_date, start_date, end_date),
@@ -1201,11 +1203,32 @@ def _canvas_due_date(value):
         return None
 
     text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+
+    if parsed is not None:
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(LOCAL_TIMEZONE)
+        if parsed.hour or parsed.minute:
+            return parsed.strftime("%Y-%m-%d %H:%M")
+        return parsed.date().isoformat()
+
     candidate = text[:10]
     try:
         datetime.strptime(candidate, "%Y-%m-%d")
     except ValueError:
         return None
+    if len(text) >= 16:
+        try:
+            datetime.strptime(text[:16], "%Y-%m-%d %H:%M")
+            return text[:16]
+        except ValueError:
+            pass
     return candidate
 
 
@@ -1216,6 +1239,25 @@ def create_canvas_assignment_task(assignment):
         return False
 
     if task_exists_by_external_id(external_source, external_id):
+        update_task_from_external_candidate({
+            "title": assignment.get("title") or "Untitled Canvas assignment",
+            "course": assignment.get("course_name"),
+            "task_type": "assignment",
+            "source": "quercus_assignment",
+            "confidence": "high",
+            "due_at": _canvas_due_date(assignment.get("due_at")),
+            "planned_date": None,
+            "estimated_minutes": None,
+            "priority": "medium",
+            "notes": None,
+            "source_url": assignment.get("external_url"),
+            "source_snippet": None,
+            "external_source": external_source,
+            "external_id": str(external_id),
+            "urgency_score": 0,
+            "urgency_label": None,
+            "recommended_status": "confirmed",
+        })
         return False
 
     external_url = assignment.get("external_url")
@@ -2900,12 +2942,32 @@ def _clean_candidate_date(value):
         return None
 
     if isinstance(value, datetime):
-        return value.date().isoformat()
+        parsed = value
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(LOCAL_TIMEZONE)
+        if parsed.hour or parsed.minute:
+            return parsed.strftime("%Y-%m-%d %H:%M")
+        return parsed.date().isoformat()
 
     if isinstance(value, date):
         return value.isoformat()
 
     text = str(value).strip()
+    if not text:
+        return None
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+
+    if parsed is not None:
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(LOCAL_TIMEZONE)
+        if parsed.hour or parsed.minute:
+            return parsed.strftime("%Y-%m-%d %H:%M")
+        return parsed.date().isoformat()
+
     candidate = text[:10]
     try:
         datetime.strptime(candidate, "%Y-%m-%d")
@@ -3086,10 +3148,10 @@ def get_task_candidates(
     if due_filter == "No due date":
         clauses.append("due_at IS NULL")
     elif due_filter == "Due today or earlier":
-        clauses.append("due_at IS NOT NULL AND due_at <= ?")
+        clauses.append("due_at IS NOT NULL AND substr(due_at, 1, 10) <= ?")
         params.append(today)
     elif due_filter == "Future due date":
-        clauses.append("due_at IS NOT NULL AND due_at > ?")
+        clauses.append("due_at IS NOT NULL AND substr(due_at, 1, 10) > ?")
         params.append(today)
 
     where_clause = ""
@@ -3156,6 +3218,65 @@ def task_exists_by_signature(source, title, course=None, due_at=None):
             ),
         )
         return cursor.fetchone() is not None
+
+
+def update_task_from_external_candidate(candidate):
+    candidate = _normalize_candidate(candidate)
+    external_source = candidate.get("external_source")
+    external_id = candidate.get("external_id")
+    if not external_source or not external_id:
+        return 0
+
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            UPDATE tasks
+            SET title = ?,
+                course = COALESCE(?, course),
+                task_type = COALESCE(?, task_type),
+                due_at = COALESCE(?, due_at),
+                planned_date = COALESCE(?, planned_date),
+                confidence = COALESCE(?, confidence),
+                external_url = COALESCE(?, external_url),
+                urgency_score = ?,
+                urgency_label = COALESCE(?, urgency_label),
+                last_scored_at = ?,
+                updated_at = ?
+            WHERE external_source = ? AND external_id = ?
+            ''',
+            (
+                candidate["title"],
+                candidate.get("course"),
+                candidate.get("task_type"),
+                candidate.get("due_at"),
+                candidate.get("planned_date"),
+                candidate.get("confidence"),
+                candidate.get("source_url"),
+                candidate.get("urgency_score") or 0,
+                candidate.get("urgency_label"),
+                now,
+                now,
+                external_source,
+                external_id,
+            ),
+        )
+        rowcount = cursor.rowcount
+        conn.commit()
+
+    if rowcount:
+        from urgency import calculate_urgency_score
+
+        updated_tasks = _fetch_tasks(
+            "WHERE external_source = ? AND external_id = ?",
+            (external_source, external_id),
+        )
+        for task in updated_tasks:
+            urgency_score, urgency_label, _ = calculate_urgency_score(task)
+            update_task_urgency(task["id"], urgency_score, urgency_label)
+
+    return rowcount
 
 
 def _candidate_priority_for_task(value):
@@ -3461,7 +3582,7 @@ def ignore_past_quercus_intake_items(today=None):
                 updated_at = ?
             WHERE status NOT IN ('done', 'ignored')
               AND due_at IS NOT NULL
-              AND due_at < ?
+              AND substr(due_at, 1, 10) < ?
               AND (
                   source IN ({','.join('?' for _ in quercus_task_sources)})
                   OR external_source IN ({','.join('?' for _ in quercus_external_sources)})
@@ -3484,7 +3605,7 @@ def ignore_past_quercus_intake_items(today=None):
                 updated_at = ?
             WHERE decision_status = 'pending'
               AND due_at IS NOT NULL
-              AND due_at < ?
+              AND substr(due_at, 1, 10) < ?
             ''',
             (now, today),
         )

@@ -5,6 +5,7 @@ import os
 import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import streamlit as st
 
@@ -118,6 +119,7 @@ from urgency import calculate_urgency_score
 BASE_DIR = Path(__file__).resolve().parent
 UPLOAD_DIR = BASE_DIR / "uploads"
 EXPORT_DIR = BASE_DIR / "data" / "exports"
+LOCAL_TIMEZONE = ZoneInfo("America/Toronto")
 
 MAIN_MENU_OPTIONS = [
     "Today",
@@ -447,6 +449,27 @@ def inject_calm_command_css():
             margin: 0.25rem 0 0.75rem;
         }
 
+        .detail-field {
+            margin-bottom: 0.8rem;
+        }
+
+        .detail-label {
+            color: var(--text-muted);
+            font-size: 0.73rem;
+            font-weight: 750;
+            line-height: 1.25;
+            margin-bottom: 0.18rem;
+            text-transform: uppercase;
+        }
+
+        .detail-value {
+            color: var(--text-secondary);
+            font-size: 0.9rem;
+            line-height: 1.45;
+            white-space: pre-wrap;
+            overflow-wrap: anywhere;
+        }
+
         .focus-timer {
             color: var(--text-main);
             font-size: 2.25rem;
@@ -499,14 +522,66 @@ def escape_html(value):
     return html.escape(display_value(value), quote=True)
 
 
+def display_task_datetime(value):
+    if not value:
+        return "-"
+
+    if isinstance(value, datetime):
+        parsed = value
+        include_time = bool(parsed.hour or parsed.minute or parsed.second)
+    elif isinstance(value, date):
+        parsed = datetime.combine(value, datetime.min.time())
+        include_time = False
+    else:
+        text = str(value).strip()
+        if not text:
+            return "-"
+
+        include_time = len(text) > 10 and (":" in text[10:] or "T" in text[10:])
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                parsed = datetime.strptime(text[:16], "%Y-%m-%d %H:%M")
+                include_time = True
+            except ValueError:
+                try:
+                    parsed = datetime.strptime(text[:10], "%Y-%m-%d")
+                    include_time = False
+                except ValueError:
+                    return text
+
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(LOCAL_TIMEZONE)
+
+    label = f"{parsed.strftime('%b')} {parsed.day}"
+    if include_time:
+        time_label = parsed.strftime("%I:%M %p").lstrip("0")
+        return f"{label}, {time_label}"
+    return label
+
+
+def render_detail_field(container, label, value, formatter=None):
+    shown_value = formatter(value) if formatter else display_value(value)
+    container.markdown(
+        (
+            '<div class="detail-field">'
+            f'<div class="detail-label">{escape_html(label)}</div>'
+            f'<div class="detail-value">{escape_html(shown_value)}</div>'
+            '</div>'
+        ),
+        unsafe_allow_html=True,
+    )
+
+
 def task_meta_line(task):
     pieces = []
     if task.get("course"):
         pieces.append(task["course"])
     if task.get("due_at"):
-        pieces.append(f"Due {task['due_at']}")
+        pieces.append(f"Due {display_task_datetime(task['due_at'])}")
     elif task.get("planned_date"):
-        pieces.append(f"Planned {task['planned_date']}")
+        pieces.append(f"Planned {display_task_datetime(task['planned_date'])}")
     if task.get("estimated_minutes"):
         pieces.append(f"{task['estimated_minutes']} min")
     if task.get("status"):
@@ -612,9 +687,9 @@ def build_7_day_timeline(tasks=None, today=None):
 
 def display_date(task):
     if task.get("due_at"):
-        return f"Due: {task['due_at']}"
+        return f"Due: {display_task_datetime(task['due_at'])}"
     if task.get("planned_date"):
-        return f"Planned: {task['planned_date']}"
+        return f"Planned: {display_task_datetime(task['planned_date'])}"
     return "No date"
 
 
@@ -705,30 +780,27 @@ def show_pending_message():
 
 def render_task_fields(task):
     first_row = st.columns(4)
-    first_row[0].markdown(f"**Course**  \n{display_value(task['course'])}")
-    first_row[1].markdown(f"**Type**  \n{display_value(task['task_type'])}")
-    first_row[2].markdown(f"**Due**  \n{display_value(task['due_at'])}")
-    first_row[3].markdown(f"**Planned**  \n{display_value(task['planned_date'])}")
+    render_detail_field(first_row[0], "Course", task.get("course"))
+    render_detail_field(first_row[1], "Type", task.get("task_type"))
+    render_detail_field(first_row[2], "Due", task.get("due_at"), display_task_datetime)
+    render_detail_field(
+        first_row[3],
+        "Planned",
+        task.get("planned_date"),
+        display_task_datetime,
+    )
 
     second_row = st.columns(4)
-    second_row[0].markdown(
-        f"**Minutes**  \n{display_value(task['estimated_minutes'])}"
-    )
-    second_row[1].markdown(f"**Priority**  \n{display_value(task['priority'])}")
-    second_row[2].markdown(f"**Status**  \n{display_value(task['status'])}")
-    second_row[3].markdown(f"**Notes**  \n{display_value(task['notes'])}")
+    render_detail_field(second_row[0], "Minutes", task.get("estimated_minutes"))
+    render_detail_field(second_row[1], "Priority", task.get("priority"))
+    render_detail_field(second_row[2], "Status", task.get("status"))
+    render_detail_field(second_row[3], "Notes", task.get("notes"))
 
     urgency_score, urgency_label = task_urgency(task)
     urgency_row = st.columns(3)
-    urgency_row[0].markdown(
-        f"**Urgency**  \n{display_value(urgency_label)}"
-    )
-    urgency_row[1].markdown(
-        f"**Urgency Score**  \n{urgency_score:.1f}"
-    )
-    urgency_row[2].markdown(
-        f"**Needs Review**  \n{display_value(task.get('needs_review'))}"
-    )
+    render_detail_field(urgency_row[0], "Urgency", urgency_label)
+    render_detail_field(urgency_row[1], "Urgency Score", f"{urgency_score:.1f}")
+    render_detail_field(urgency_row[2], "Needs Review", task.get("needs_review"))
 
     has_extraction_fields = (
         task.get("source") not in (None, "", "manual")
@@ -737,13 +809,9 @@ def render_task_fields(task):
     )
     if has_extraction_fields:
         third_row = st.columns(3)
-        third_row[0].markdown(f"**Source**  \n{display_value(task.get('source'))}")
-        third_row[1].markdown(
-            f"**Confidence**  \n{display_value(task.get('confidence'))}"
-        )
-        third_row[2].markdown(
-            f"**Source Snippet**  \n{display_value(task.get('source_snippet'))}"
-        )
+        render_detail_field(third_row[0], "Source", task.get("source"))
+        render_detail_field(third_row[1], "Confidence", task.get("confidence"))
+        render_detail_field(third_row[2], "Source Snippet", task.get("source_snippet"))
 
     behavior_fields = [
         task.get("first_action"),
@@ -756,25 +824,25 @@ def render_task_fields(task):
     if any(behavior_fields):
         st.markdown("**Behavior Design**")
         if task.get("first_action"):
-            st.markdown(f"**First action:** {task['first_action']}")
+            render_detail_field(st, "First action", task["first_action"])
         if task.get("next_action"):
-            st.markdown(f"**Next 25 minutes:** {task['next_action']}")
+            render_detail_field(st, "Next 25 minutes", task["next_action"])
 
         behavior_row = st.columns(4)
-        behavior_row[0].markdown(
-            f"**Energy**  \n{display_value(task.get('energy_level'))}"
+        render_detail_field(behavior_row[0], "Energy", task.get("energy_level"))
+        render_detail_field(behavior_row[1], "Load", task.get("cognitive_load"))
+        render_detail_field(
+            behavior_row[2],
+            "Friction",
+            task.get("emotional_friction"),
         )
-        behavior_row[1].markdown(
-            f"**Load**  \n{display_value(task.get('cognitive_load'))}"
-        )
-        behavior_row[2].markdown(
-            f"**Friction**  \n{display_value(task.get('emotional_friction'))}"
-        )
-        behavior_row[3].markdown(
-            f"**Avoidance**  \n{display_value(task.get('avoidance_risk'))}"
+        render_detail_field(
+            behavior_row[3],
+            "Avoidance",
+            task.get("avoidance_risk"),
         )
         if task.get("behavior_prompt"):
-            st.caption(task["behavior_prompt"])
+            render_detail_field(st, "Prompt", task["behavior_prompt"])
 
 
 def render_status_actions(task, current_view):
@@ -1005,11 +1073,11 @@ def render_ai_boss_task_card(task, task_lookup):
                 f"**Current Status**  \n{display_value(existing_task.get('status'))}"
             )
             columns[1].markdown(
-                f"**Due**  \n{display_value(existing_task.get('due_at'))}"
+                f"**Due**  \n{display_task_datetime(existing_task.get('due_at'))}"
             )
             columns[2].markdown(
                 "**Planned**  \n"
-                f"{display_value(existing_task.get('planned_date'))}"
+                f"{display_task_datetime(existing_task.get('planned_date'))}"
             )
 
         st.markdown(f"**Reason**  \n{display_value(task.get('reason'))}")
@@ -1246,7 +1314,7 @@ def render_behavior_task_card(task_plan, task_lookup, key_prefix):
                 f"**Status**  \n{display_value(existing_task.get('status'))}"
             )
             columns[1].markdown(
-                f"**Due**  \n{display_value(existing_task.get('due_at'))}"
+                f"**Due**  \n{display_task_datetime(existing_task.get('due_at'))}"
             )
             columns[2].markdown(
                 f"**Urgency**  \n{display_value(existing_task.get('urgency_label'))}"
@@ -2658,7 +2726,7 @@ def render_daily_command_task_card(task, task_lookup):
                 f"**Status**  \n{display_value(existing_task.get('status'))}"
             )
             columns[1].markdown(
-                f"**Due**  \n{display_value(existing_task.get('due_at'))}"
+                f"**Due**  \n{display_task_datetime(existing_task.get('due_at'))}"
             )
             columns[2].markdown(
                 f"**Urgency**  \n{display_value(existing_task.get('urgency_label'))}"
@@ -3038,7 +3106,9 @@ def render_extracted_task_review(tasks):
             )
 
             columns = st.columns(3)
-            columns[0].markdown(f"**Due**  \n{display_value(task.get('due_at'))}")
+            columns[0].markdown(
+                f"**Due**  \n{display_task_datetime(task.get('due_at'))}"
+            )
             columns[1].markdown(
                 f"**Minutes**  \n{display_value(task.get('estimated_minutes'))}"
             )
@@ -3433,7 +3503,9 @@ def render_candidate_fields(candidate):
     columns[2].markdown(
         f"**Confidence**  \n{display_value(candidate['confidence'])}"
     )
-    columns[3].markdown(f"**Due**  \n{display_value(candidate['due_at'])}")
+    columns[3].markdown(
+        f"**Due**  \n{display_task_datetime(candidate['due_at'])}"
+    )
 
     columns = st.columns(4)
     columns[0].markdown(
@@ -3645,9 +3717,11 @@ def render_top_urgent_tasks():
             st.markdown(f"#### {display_value(task['title'])}")
             columns = st.columns(4)
             columns[0].markdown(f"**Course**  \n{display_value(task['course'])}")
-            columns[1].markdown(f"**Due**  \n{display_value(task['due_at'])}")
+            columns[1].markdown(
+                f"**Due**  \n{display_task_datetime(task['due_at'])}"
+            )
             columns[2].markdown(
-                f"**Planned**  \n{display_value(task['planned_date'])}"
+                f"**Planned**  \n{display_task_datetime(task['planned_date'])}"
             )
             columns[3].markdown(
                 f"**Priority**  \n{display_value(task['priority'])}"
