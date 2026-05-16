@@ -15,7 +15,7 @@ from ai_chat import (
     AIChatResponseError,
     build_chat_context,
     generate_chat_response,
-    has_openai_api_key as has_ai_chat_api_key,
+    openai_api_key_status as ai_chat_api_key_status,
 )
 from ai_boss import (
     AIBossConfigError,
@@ -1171,9 +1171,9 @@ def render_ai_boss_chat():
     st.markdown("## AI Boss Chat")
     st.caption("Talk to the execution manager. MVP-16A is read-only: it can propose actions, but it cannot execute them.")
 
-    key_present = has_ai_chat_api_key()
+    key_present, key_message = ai_chat_api_key_status()
     if not key_present:
-        st.warning("Add OPENAI_API_KEY to your .env file to use AI Boss Chat.")
+        st.warning(key_message)
 
     context = build_chat_context()
     with st.expander("Context used by AI", expanded=False):
@@ -1219,8 +1219,8 @@ def render_ai_boss_chat():
                     if error.raw_response:
                         st.text_area("Raw AI response", value=error.raw_response, height=220)
                     return
-                except Exception as error:
-                    st.error(f"Could not generate chat response: {error}")
+                except Exception:
+                    st.error("Could not generate chat response. Check your OpenAI settings and try again.")
                     return
 
             metadata = {

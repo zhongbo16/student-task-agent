@@ -53,8 +53,18 @@ def _load_env_file():
 
 
 def has_openai_api_key():
+    configured, _ = openai_api_key_status()
+    return configured
+
+
+def openai_api_key_status():
     _load_env_file()
-    return bool(os.environ.get("OPENAI_API_KEY"))
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return False, "OPENAI_API_KEY is missing. Add it to your .env file to use AI Boss Chat."
+    if not api_key.startswith("sk-"):
+        return False, "OPENAI_API_KEY does not look like an OpenAI key. It should usually start with sk-. Check your .env file."
+    return True, "OPENAI_API_KEY is configured."
 
 
 def _openai_client():
@@ -63,6 +73,10 @@ def _openai_client():
     if not api_key:
         raise AIChatConfigError(
             "OPENAI_API_KEY is missing. Add it to your .env file to use AI Boss Chat."
+        )
+    if not api_key.startswith("sk-"):
+        raise AIChatConfigError(
+            "OPENAI_API_KEY does not look like an OpenAI API key. It should usually start with sk-. Check your .env file."
         )
 
     try:
@@ -350,24 +364,43 @@ def generate_chat_response(user_message, recent_messages, context):
         DEFAULT_MODEL,
     )
 
-    response = client.chat.completions.create(
-        model=model,
-        temperature=0.2,
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": prompt},
-            {
-                "role": "user",
-                "content": (
-                    "Compact local app context JSON:\n"
-                    f"{json.dumps(context, ensure_ascii=False)}\n\n"
-                    "Recent chat messages JSON:\n"
-                    f"{json.dumps(_compact_recent_messages(recent_messages), ensure_ascii=False)}\n\n"
-                    f"User message:\n{cleaned_message}"
-                ),
-            },
-        ],
-    )
+    try:
+        response = client.chat.completions.create(
+            model=model,
+            temperature=0.2,
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": prompt},
+                {
+                    "role": "user",
+                    "content": (
+                        "Compact local app context JSON:\n"
+                        f"{json.dumps(context, ensure_ascii=False)}\n\n"
+                        "Recent chat messages JSON:\n"
+                        f"{json.dumps(_compact_recent_messages(recent_messages), ensure_ascii=False)}\n\n"
+                        f"User message:\n{cleaned_message}"
+                    ),
+                },
+            ],
+        )
+    except Exception as error:
+        error_name = error.__class__.__name__.lower()
+        error_text = str(error).lower()
+        if (
+            "authentication" in error_name
+            or "invalid_api_key" in error_text
+            or "incorrect api key" in error_text
+        ):
+            raise AIChatConfigError(
+                "OpenAI rejected OPENAI_API_KEY. Check that .env contains a valid OpenAI key, not the Canvas URL or Canvas token."
+            ) from error
+        if "rate" in error_name:
+            raise AIChatResponseError(
+                "OpenAI rate limit was reached. Wait a moment and try again."
+            ) from error
+        raise AIChatResponseError(
+            "OpenAI request failed. Check your model, network, or API key settings and try again."
+        ) from error
 
     content = response.choices[0].message.content or "{}"
     try:
