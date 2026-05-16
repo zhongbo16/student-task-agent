@@ -926,6 +926,58 @@ def render_ai_boss_chat():
     with st.expander("Context used by AI", expanded=False):
         render_chat_context_summary(context)
 
+    with st.container(border=True):
+        st.markdown("### Talk to AI Boss")
+        st.caption("Use this like a large command box. The agent can answer and propose actions, but it will not execute them yet.")
+        with st.form("ai_boss_chat_form", clear_on_submit=True):
+            message = st.text_area(
+                "Message",
+                placeholder=(
+                    "Example: I have 2 hours, low energy, and I am avoiding "
+                    "CLA task 2. What should I do first?"
+                ),
+                height=180,
+                label_visibility="collapsed",
+                disabled=not key_present,
+            )
+            submitted = st.form_submit_button(
+                "Send to AI Boss",
+                disabled=not key_present,
+            )
+
+        if submitted:
+            message = (message or "").strip()
+            if not message:
+                st.warning("Write a message first.")
+                return
+
+            save_chat_message("user", message)
+            recent_messages = get_recent_chat_messages(limit=30)
+            context = build_chat_context()
+
+            with st.spinner("AI Boss is reading the local context..."):
+                try:
+                    response = generate_chat_response(message, recent_messages, context)
+                except (AIChatConfigError, ValueError) as error:
+                    st.error(str(error))
+                    return
+                except AIChatResponseError as error:
+                    st.error(str(error))
+                    if error.raw_response:
+                        st.text_area("Raw AI response", value=error.raw_response, height=220)
+                    return
+                except Exception as error:
+                    st.error(f"Could not generate chat response: {error}")
+                    return
+
+            metadata = {
+                "proposed_actions": response.get("proposed_actions") or [],
+                "questions": response.get("questions") or [],
+                "context_counts": context.get("counts", {}),
+            }
+            save_chat_message("assistant", response.get("message"), metadata=metadata)
+            st.rerun()
+
     messages = get_recent_chat_messages(limit=30)
     st.markdown('<div class="chat-shell">', unsafe_allow_html=True)
     if not messages:
@@ -947,40 +999,6 @@ def render_ai_boss_chat():
             deleted = clear_chat_history()
             st.success(f"Cleared {deleted} chat messages.")
             st.rerun()
-
-    message = st.chat_input(
-        "Ask AI Boss what to do next...",
-        disabled=not key_present,
-    )
-    if not message:
-        return
-
-    save_chat_message("user", message)
-    recent_messages = get_recent_chat_messages(limit=30)
-    context = build_chat_context()
-
-    with st.spinner("AI Boss is reading the local context..."):
-        try:
-            response = generate_chat_response(message, recent_messages, context)
-        except (AIChatConfigError, ValueError) as error:
-            st.error(str(error))
-            return
-        except AIChatResponseError as error:
-            st.error(str(error))
-            if error.raw_response:
-                st.text_area("Raw AI response", value=error.raw_response, height=220)
-            return
-        except Exception as error:
-            st.error(f"Could not generate chat response: {error}")
-            return
-
-    metadata = {
-        "proposed_actions": response.get("proposed_actions") or [],
-        "questions": response.get("questions") or [],
-        "context_counts": context.get("counts", {}),
-    }
-    save_chat_message("assistant", response.get("message"), metadata=metadata)
-    st.rerun()
 
 
 def render_task_fields(task):
