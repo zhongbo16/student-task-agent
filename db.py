@@ -39,6 +39,7 @@ VALID_CANDIDATE_DECISIONS = (
     "ignored",
     "duplicate",
 )
+VALID_TASK_UPDATE_STATUSES = ("pending", "accepted", "ignored")
 VALID_COMMITMENT_STATUSES = ("planned", "done", "ignored")
 VALID_COMMITMENT_TYPES = (
     "gym",
@@ -79,6 +80,7 @@ def _create_tasks_table(cursor, table_name="tasks"):
             course TEXT,
             task_type TEXT,
             due_at TEXT,
+            weight TEXT,
             planned_date TEXT,
             estimated_minutes INTEGER CHECK (
                 estimated_minutes IS NULL OR estimated_minutes > 0
@@ -231,6 +233,44 @@ def _create_behavior_plans_table(cursor):
             planning_cap_minutes INTEGER,
             output_json TEXT,
             raw_response TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+    ''')
+
+
+def _create_documents_table(cursor):
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT,
+            document_type TEXT,
+            raw_text TEXT,
+            filename TEXT,
+            file_type TEXT,
+            created_at TEXT
+        )
+    ''')
+
+
+def _create_task_updates_table(cursor):
+    allowed_statuses = "', '".join(VALID_TASK_UPDATE_STATUSES)
+    cursor.execute(f'''
+        CREATE TABLE IF NOT EXISTS task_updates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id INTEGER NOT NULL,
+            document_id INTEGER,
+            old_due_at TEXT,
+            new_due_at TEXT,
+            source_snippet TEXT,
+            confidence TEXT CHECK (
+                confidence IS NULL
+                OR confidence IN ('high', 'medium', 'low')
+            ),
+            reason TEXT,
+            status TEXT DEFAULT 'pending' CHECK (
+                status IN ('{allowed_statuses}')
+            ),
             created_at TEXT,
             updated_at TEXT
         )
@@ -520,6 +560,8 @@ def _database_needs_backup_before_init():
         daily_reviews_missing = not _table_exists(cursor, "daily_reviews")
         agent_memory_missing = not _table_exists(cursor, "agent_memory")
         ai_boss_briefings_missing = not _table_exists(cursor, "ai_boss_briefings")
+        documents_missing = not _table_exists(cursor, "documents")
+        task_updates_missing = not _table_exists(cursor, "task_updates")
         task_candidates_missing = not _table_exists(cursor, "task_candidates")
         course_archives_missing = not _table_exists(cursor, "course_archives")
         morning_checkins_missing = not _table_exists(cursor, "morning_checkins")
@@ -551,6 +593,8 @@ def _database_needs_backup_before_init():
             or daily_reviews_missing
             or agent_memory_missing
             or ai_boss_briefings_missing
+            or documents_missing
+            or task_updates_missing
             or task_candidates_missing
             or course_archives_missing
             or morning_checkins_missing
@@ -665,7 +709,7 @@ def _migrate_tasks_table(cursor, existing_columns):
 
     cursor.execute(f'''
         INSERT INTO tasks (
-            id, title, course, task_type, due_at, planned_date,
+            id, title, course, task_type, due_at, weight, planned_date,
             estimated_minutes, priority, status, source, confidence, notes,
             source_snippet, external_id, external_source, external_url,
             urgency_score, urgency_label, auto_created, needs_review,
@@ -680,6 +724,7 @@ def _migrate_tasks_table(cursor, existing_columns):
             {text_expr("course")},
             {text_expr("task_type")},
             {text_expr("due_at")},
+            {text_expr("weight")},
             {text_expr("planned_date")},
             {estimated_minutes_expr},
             {priority_expr},
@@ -712,7 +757,7 @@ def _migrate_tasks_table(cursor, existing_columns):
 
 
 TASK_SELECT = '''
-    SELECT id, title, course, task_type, due_at, planned_date,
+    SELECT id, title, course, task_type, due_at, weight, planned_date,
            estimated_minutes, priority, status, source, confidence, notes,
            source_snippet, external_id, external_source, external_url,
            urgency_score, urgency_label, auto_created, needs_review,
@@ -823,6 +868,8 @@ def init_db():
         _create_personal_commitments_table(cursor)
         _create_daily_commands_table(cursor)
         _create_behavior_plans_table(cursor)
+        _create_documents_table(cursor)
+        _create_task_updates_table(cursor)
         _create_daily_command_reviews_table(cursor)
         _create_agent_memory_candidates_table(cursor)
         _create_checkin_answers_table(cursor)
@@ -1112,17 +1159,18 @@ def create_task(task):
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO tasks (
-                title, course, task_type, due_at, planned_date,
+                title, course, task_type, due_at, weight, planned_date,
                 estimated_minutes, priority, status, source, confidence, notes,
                 source_snippet, external_id, external_source, external_url,
                 urgency_score, urgency_label, auto_created, needs_review,
                 last_scored_at, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (
             task["title"],
             task["course"],
             task["task_type"],
             task["due_at"],
+            task["weight"],
             task["planned_date"],
             task["estimated_minutes"],
             task["priority"],
@@ -1210,6 +1258,275 @@ def update_task_status(task_id, status):
 
         urgency_score, urgency_label, _ = calculate_urgency_score(updated_task[0])
         update_task_urgency(task_id, urgency_score, urgency_label)
+
+
+def update_task_fields(task_id, updates):
+    allowed_fields = {
+        "title",
+        "course",
+        "task_type",
+        "due_at",
+        "weight",
+        "planned_date",
+        "estimated_minutes",
+        "priority",
+        "confidence",
+        "notes",
+        "source_snippet",
+    }
+    clean_updates = {
+        key: value for key, value in (updates or {}).items()
+        if key in allowed_fields
+    }
+    if not clean_updates:
+        return False
+
+    existing = _fetch_tasks("WHERE id = ?", (task_id,))
+    if not existing:
+        return False
+
+    merged = dict(existing[0])
+    merged.update(clean_updates)
+    normalized = normalize_task(merged)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    fields = [
+        "title",
+        "course",
+        "task_type",
+        "due_at",
+        "weight",
+        "planned_date",
+        "estimated_minutes",
+        "priority",
+        "confidence",
+        "notes",
+        "source_snippet",
+    ]
+    assignments = ", ".join(f"{field} = ?" for field in fields)
+    values = [normalized[field] for field in fields]
+    values.extend([now, task_id])
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f'''
+            UPDATE tasks
+            SET {assignments}, updated_at = ?
+            WHERE id = ?
+            ''',
+            tuple(values),
+        )
+        conn.commit()
+
+    from urgency import calculate_urgency_score
+
+    updated_task = _fetch_tasks("WHERE id = ?", (task_id,))
+    if updated_task:
+        urgency_score, urgency_label, _ = calculate_urgency_score(updated_task[0])
+        update_task_urgency(task_id, urgency_score, urgency_label)
+    return True
+
+
+def create_document(document):
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO documents (
+                title, document_type, raw_text, filename, file_type, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                _clean_candidate_text(document.get("title")),
+                _clean_candidate_text(document.get("document_type")) or "other",
+                document.get("raw_text"),
+                _clean_candidate_text(document.get("filename")),
+                _clean_candidate_text(document.get("file_type")),
+                now,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_recent_documents(limit=20):
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, title, document_type, raw_text, filename, file_type, created_at
+            FROM documents
+            ORDER BY created_at DESC
+            LIMIT ?
+            ''',
+            (int(limit),),
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def _clean_task_update(update):
+    status = _clean_candidate_text(update.get("status")) or "pending"
+    if status not in VALID_TASK_UPDATE_STATUSES:
+        status = "pending"
+
+    confidence = _clean_candidate_text(update.get("confidence"))
+    if confidence:
+        confidence = confidence.lower()
+        if confidence not in VALID_MEMORY_CONFIDENCES:
+            confidence = "low"
+
+    return {
+        "task_id": int(update["task_id"]),
+        "document_id": update.get("document_id"),
+        "old_due_at": _clean_candidate_date(update.get("old_due_at")),
+        "new_due_at": _clean_candidate_date(update.get("new_due_at")),
+        "source_snippet": _clean_candidate_text(update.get("source_snippet")),
+        "confidence": confidence,
+        "reason": _clean_candidate_text(update.get("reason")),
+        "status": status,
+    }
+
+
+def create_task_update(update):
+    update = _clean_task_update(update)
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id
+            FROM task_updates
+            WHERE task_id = ?
+              AND status = 'pending'
+              AND COALESCE(new_due_at, '') = COALESCE(?, '')
+            LIMIT 1
+            ''',
+            (update["task_id"], update["new_due_at"] or ""),
+        )
+        existing = cursor.fetchone()
+        if existing:
+            return existing["id"]
+
+        cursor.execute(
+            '''
+            INSERT INTO task_updates (
+                task_id, document_id, old_due_at, new_due_at, source_snippet,
+                confidence, reason, status, created_at, updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                update["task_id"],
+                update["document_id"],
+                update["old_due_at"],
+                update["new_due_at"],
+                update["source_snippet"],
+                update["confidence"],
+                update["reason"],
+                update["status"],
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def _fetch_task_updates(where_clause="", params=()):
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            f'''
+            SELECT
+                task_updates.id,
+                task_updates.task_id,
+                task_updates.document_id,
+                task_updates.old_due_at,
+                task_updates.new_due_at,
+                task_updates.source_snippet,
+                task_updates.confidence,
+                task_updates.reason,
+                task_updates.status,
+                task_updates.created_at,
+                task_updates.updated_at,
+                tasks.title AS task_title,
+                tasks.course AS task_course,
+                documents.title AS document_title
+            FROM task_updates
+            LEFT JOIN tasks ON tasks.id = task_updates.task_id
+            LEFT JOIN documents ON documents.id = task_updates.document_id
+            {where_clause}
+            ORDER BY task_updates.created_at DESC
+            ''',
+            params,
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def get_pending_task_updates():
+    return _fetch_task_updates("WHERE task_updates.status = 'pending'")
+
+
+def update_task_update_status(update_id, status):
+    if status not in VALID_TASK_UPDATE_STATUSES:
+        raise ValueError(
+            "Update status must be one of: "
+            f"{', '.join(VALID_TASK_UPDATE_STATUSES)}."
+        )
+
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            UPDATE task_updates
+            SET status = ?, updated_at = ?
+            WHERE id = ?
+            ''',
+            (status, now, update_id),
+        )
+        conn.commit()
+
+
+def accept_task_update(update_id, new_due_at=None):
+    records = _fetch_task_updates("WHERE task_updates.id = ? LIMIT 1", (update_id,))
+    if not records:
+        return False
+
+    record = records[0]
+    due_at = _clean_candidate_date(new_due_at) or record.get("new_due_at")
+    if not due_at:
+        return False
+
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            UPDATE tasks
+            SET due_at = ?, updated_at = ?
+            WHERE id = ?
+            ''',
+            (due_at, now, record["task_id"]),
+        )
+        cursor.execute(
+            '''
+            UPDATE task_updates
+            SET new_due_at = ?, status = 'accepted', updated_at = ?
+            WHERE id = ?
+            ''',
+            (due_at, now, update_id),
+        )
+        conn.commit()
+
+    updated_task = _fetch_tasks("WHERE id = ?", (record["task_id"],))
+    if updated_task:
+        from urgency import calculate_urgency_score
+
+        urgency_score, urgency_label, _ = calculate_urgency_score(updated_task[0])
+        update_task_urgency(record["task_id"], urgency_score, urgency_label)
+    return True
 
 
 def task_exists_by_external_id(external_source, external_id):

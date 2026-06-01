@@ -3,6 +3,7 @@ import html
 import json
 import os
 import re
+from difflib import SequenceMatcher
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -61,6 +62,7 @@ from question_coach import (
 )
 from db import (
     archive_course,
+    accept_task_update,
     clear_chat_history,
     complete_study_session,
     create_agent_memory,
@@ -72,7 +74,9 @@ from db import (
     create_or_update_daily_refresh_run,
     create_or_update_daily_review,
     create_personal_commitment,
+    create_document,
     create_task,
+    create_task_update,
     create_canvas_assignment_task,
     create_study_session_start,
     deactivate_agent_memory,
@@ -91,6 +95,7 @@ from db import (
     get_course_summaries,
     get_morning_checkin_by_date,
     get_pending_agent_memory_candidates,
+    get_pending_task_updates,
     get_recent_command_center_messages,
     memory_exists,
     get_personal_commitments_for_date,
@@ -117,9 +122,11 @@ from db import (
     unarchive_course,
     update_agent_memory_candidate_decision,
     update_chat_message_metadata,
+    update_task_fields,
     update_task_behavior_fields,
     update_personal_commitment_status,
     update_task_candidate_decision,
+    update_task_update_status,
     update_task_status,
 )
 from file_parser import extract_text_from_pdf, get_file_metadata
@@ -133,14 +140,16 @@ EXPORT_DIR = BASE_DIR / "data" / "exports"
 LOCAL_TIMEZONE = ZoneInfo("America/Toronto")
 
 MAIN_MENU_OPTIONS = [
-    "AI Boss Chat",
-    "Today",
-    "Focus",
-    "Review",
-    "Advanced",
+    "Add Material",
+    "Review Suggestions",
+    "Tasks",
+    "Check Updates",
+    "Settings",
 ]
 
-ADVANCED_MENU_OPTIONS = [
+EXPERIMENTAL_MENU_OPTIONS = [
+    "AI Boss Chat",
+    "Command Center",
     "Tasks",
     "Today",
     "This Week",
@@ -164,6 +173,15 @@ ADVANCED_MENU_OPTIONS = [
     "Memory",
     "Add Task",
     "All Tasks",
+]
+
+ADVANCED_MENU_OPTIONS = EXPERIMENTAL_MENU_OPTIONS
+
+DOCUMENT_TYPES = [
+    "syllabus",
+    "announcement",
+    "assignment instruction",
+    "other",
 ]
 
 STATUS_ACTIONS = {
@@ -3552,6 +3570,451 @@ def render_feedback_loop():
     render_recent_feedback_reviews()
 
 
+def normalize_match_text(value):
+    text = re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold())
+    return " ".join(text.split())
+
+
+def date_key(value):
+    parsed = parse_timeline_date(value)
+    return parsed.isoformat() if parsed else None
+
+
+def task_similarity(left, right):
+    left_text = normalize_match_text(left)
+    right_text = normalize_match_text(right)
+    if not left_text or not right_text:
+        return 0
+    return SequenceMatcher(None, left_text, right_text).ratio()
+
+
+def find_possible_task_match(candidate, tasks, threshold=0.78):
+    candidate_title = candidate.get("title")
+    candidate_course = normalize_match_text(candidate.get("course"))
+    candidate_type = normalize_match_text(candidate.get("task_type"))
+    best_match = None
+    best_score = 0
+
+    for task in tasks:
+        title_score = task_similarity(candidate_title, task.get("title"))
+        if candidate_course and normalize_match_text(task.get("course")) == candidate_course:
+            title_score += 0.08
+        if candidate_type and normalize_match_text(task.get("task_type")) == candidate_type:
+            title_score += 0.04
+        if title_score > best_score:
+            best_score = title_score
+            best_match = task
+
+    if best_match and best_score >= threshold:
+        return best_match, min(best_score, 1.0)
+    return None, best_score
+
+
+def v0_task_payload(task, document_type, notes_prefix=None):
+    notes = task.get("notes")
+    if notes_prefix:
+        notes = f"{notes_prefix}\n{notes}" if notes else notes_prefix
+
+    return {
+        "title": task.get("title"),
+        "course": task.get("course"),
+        "task_type": task.get("task_type") or "other",
+        "due_at": task.get("due_at"),
+        "weight": task.get("weight"),
+        "planned_date": None,
+        "estimated_minutes": task.get("estimated_minutes"),
+        "priority": task.get("priority") or 3,
+        "status": "suggested",
+        "source": document_type,
+        "confidence": task.get("confidence") or "low",
+        "notes": notes,
+        "source_snippet": task.get("source_snippet"),
+        "needs_review": 1,
+    }
+
+
+def extract_suggestions_from_material(raw_text, document_type):
+    with st.spinner("Extracting task suggestions..."):
+        return extract_tasks_from_text(raw_text, source=document_type)
+
+
+def save_material_document(title, document_type, raw_text, filename=None, file_type=None):
+    return create_document({
+        "title": title or filename or f"{document_type.title()} material",
+        "document_type": document_type,
+        "raw_text": raw_text,
+        "filename": filename,
+        "file_type": file_type,
+    })
+
+
+def render_suggestion_summary(task):
+    columns = st.columns(4)
+    columns[0].markdown(f"**Course**  \n{display_value(task.get('course'))}")
+    columns[1].markdown(f"**Type**  \n{display_value(task.get('task_type'))}")
+    columns[2].markdown(f"**Due**  \n{display_task_datetime(task.get('due_at'))}")
+    columns[3].markdown(f"**Confidence**  \n{display_value(task.get('confidence'))}")
+
+    more = st.columns(3)
+    more[0].markdown(f"**Weight**  \n{display_value(task.get('weight'))}")
+    more[1].markdown(f"**Status**  \n{display_value(task.get('status'))}")
+    more[2].markdown(f"**Source**  \n{display_value(task.get('source'))}")
+
+    if task.get("notes"):
+        st.markdown(f"**Reason / Notes**  \n{display_value(task.get('notes'))}")
+    st.markdown(f"**Source snippet**  \n{display_value(task.get('source_snippet'))}")
+
+
+def render_suggestion_edit_form(task):
+    with st.expander("Edit before confirming"):
+        with st.form(f"edit-suggestion-{task['id']}"):
+            title = st.text_input("Title", value=task.get("title") or "")
+            course = st.text_input("Course", value=task.get("course") or "")
+            task_type = st.text_input("Task type", value=task.get("task_type") or "")
+            due_at = st.text_input(
+                "Due date",
+                value=task.get("due_at") or "",
+                placeholder="YYYY-MM-DD or YYYY-MM-DD HH:MM",
+            )
+            weight = st.text_input("Weight", value=task.get("weight") or "")
+            confidence = st.selectbox(
+                "Confidence",
+                options=["high", "medium", "low"],
+                index=["high", "medium", "low"].index(
+                    task.get("confidence") if task.get("confidence") in ("high", "medium", "low") else "medium"
+                ),
+            )
+            notes = st.text_area("Reason / Notes", value=task.get("notes") or "")
+            source_snippet = st.text_area(
+                "Source snippet",
+                value=task.get("source_snippet") or "",
+            )
+            submitted = st.form_submit_button("Save Edits")
+
+        if submitted:
+            try:
+                update_task_fields(
+                    task["id"],
+                    {
+                        "title": title,
+                        "course": course,
+                        "task_type": task_type,
+                        "due_at": due_at,
+                        "weight": weight,
+                        "confidence": confidence,
+                        "notes": notes,
+                        "source_snippet": source_snippet,
+                    },
+                )
+            except ValueError as error:
+                st.error(str(error))
+            else:
+                st.success("Suggestion updated.")
+                st.rerun()
+
+
+def render_review_suggestions():
+    st.subheader("Review Suggestions")
+    st.caption(
+        "AI suggestions stay here until you confirm or ignore them. "
+        "Use the source snippet to verify each item."
+    )
+    suggestions = sort_tasks_for_dashboard(get_tasks_by_status("suggested"), "All Tasks")
+    if not suggestions:
+        st.info("No pending suggestions. Add course material to create suggestions.")
+        return
+
+    for task in suggestions:
+        with st.container(border=True):
+            st.markdown(f"### {display_value(task.get('title'))}")
+            render_suggestion_summary(task)
+            render_suggestion_edit_form(task)
+            columns = st.columns(2)
+            with columns[0]:
+                if st.button("Confirm", key=f"v0-confirm-{task['id']}", type="primary"):
+                    update_task_status(task["id"], "confirmed")
+                    st.success("Task confirmed.")
+                    st.rerun()
+            with columns[1]:
+                if st.button("Ignore", key=f"v0-ignore-{task['id']}"):
+                    update_task_status(task["id"], "ignored")
+                    st.success("Suggestion ignored.")
+                    st.rerun()
+
+
+def render_add_material():
+    st.subheader("Add Material")
+    st.caption(
+        "Upload a PDF or paste course text. The app extracts suggestions only; "
+        "you decide what becomes a confirmed task."
+    )
+
+    document_type = st.selectbox("Material type", DOCUMENT_TYPES)
+    title = st.text_input("Title", placeholder="Example: STA457 syllabus")
+    uploaded_file = st.file_uploader("Upload PDF", type=["pdf"])
+    pasted_text = st.text_area(
+        "Or paste course material",
+        placeholder="Paste syllabus, announcement, or assignment instructions here...",
+        height=240,
+    )
+
+    if st.button("Extract Suggestions", type="primary"):
+        raw_text = (pasted_text or "").strip()
+        filename = None
+        file_type = None
+
+        if uploaded_file is not None:
+            UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
+            saved_path = UPLOAD_DIR / safe_filename(uploaded_file.name)
+            saved_path.write_bytes(uploaded_file.getbuffer())
+            filename = uploaded_file.name
+            file_type = "pdf"
+            try:
+                raw_text = extract_text_from_pdf(saved_path)
+            except Exception as error:
+                st.error(f"Could not read this PDF: {error}")
+                return
+
+        if not raw_text:
+            st.warning("Upload a PDF or paste material first.")
+            return
+
+        document_id = save_material_document(
+            title=title,
+            document_type=document_type,
+            raw_text=raw_text,
+            filename=filename,
+            file_type=file_type,
+        )
+
+        try:
+            extracted_tasks = extract_suggestions_from_material(raw_text, document_type)
+        except Exception as error:
+            st.error(f"Could not extract suggestions: {error}")
+            return
+
+        saved_count = 0
+        duplicate_count = 0
+        existing_tasks = get_all_tasks()
+        for task in extracted_tasks:
+            match, score = find_possible_task_match(task, existing_tasks)
+            if match and date_key(match.get("due_at")) == date_key(task.get("due_at")):
+                duplicate_count += 1
+                continue
+
+            notes_prefix = f"Document #{document_id}"
+            if match:
+                notes_prefix += (
+                    f"\nPossible duplicate of task #{match['id']} "
+                    f"({score:.0%} title match)."
+                )
+            create_task(v0_task_payload(task, document_type, notes_prefix))
+            saved_count += 1
+
+        st.success(
+            f"Saved {saved_count} suggestions for review."
+            + (f" Skipped {duplicate_count} likely duplicates." if duplicate_count else "")
+        )
+        if saved_count:
+            st.info("Open Review Suggestions to confirm, edit, or ignore them.")
+
+
+def active_confirmed_tasks():
+    return [
+        task for task in get_all_tasks()
+        if task.get("status") in ("confirmed", "in_progress")
+    ]
+
+
+def v0_tasks_for_view(view_name):
+    tasks = active_confirmed_tasks()
+    today = date.today()
+
+    if view_name == "Today":
+        tasks = [
+            task for task in tasks
+            if (
+                date_key(task.get("due_at")) == today.isoformat()
+                or date_key(task.get("planned_date")) == today.isoformat()
+                or (
+                    parse_timeline_date(task.get("due_at"))
+                    and parse_timeline_date(task.get("due_at")) < today
+                )
+            )
+        ]
+    elif view_name == "This Week":
+        end_date = today + timedelta(days=7)
+        tasks = [
+            task for task in tasks
+            if (
+                parse_timeline_date(task.get("due_at"))
+                and today <= parse_timeline_date(task.get("due_at")) <= end_date
+            )
+            or (
+                parse_timeline_date(task.get("planned_date"))
+                and today <= parse_timeline_date(task.get("planned_date")) <= end_date
+            )
+        ]
+    elif view_name == "Done":
+        tasks = get_tasks_by_status("done")
+
+    return sort_tasks_for_dashboard(tasks, view_name)
+
+
+def render_v0_task_cards(tasks, view_name):
+    if not tasks:
+        st.info("No tasks in this view.")
+        return
+
+    for task in tasks:
+        with st.container(border=True):
+            st.markdown(f"### {display_value(task.get('title'))}")
+            columns = st.columns(4)
+            columns[0].markdown(f"**Course**  \n{display_value(task.get('course'))}")
+            columns[1].markdown(f"**Type**  \n{display_value(task.get('task_type'))}")
+            columns[2].markdown(f"**Due**  \n{display_task_datetime(task.get('due_at'))}")
+            columns[3].markdown(f"**Weight**  \n{display_value(task.get('weight'))}")
+            if task.get("source_snippet"):
+                with st.expander("Source snippet"):
+                    st.write(task["source_snippet"])
+            with st.expander("Details"):
+                render_task_fields(task)
+            if task.get("status") == "done":
+                if st.button("Reopen", key=f"v0-reopen-{task['id']}"):
+                    update_task_status(task["id"], "confirmed")
+                    st.rerun()
+            else:
+                if st.button("Mark Done", key=f"v0-done-{task['id']}", type="primary"):
+                    update_task_status(task["id"], "done")
+                    st.rerun()
+
+
+def render_v0_tasks():
+    st.subheader("Tasks")
+    st.caption("Confirmed course tasks live here after you approve suggestions.")
+    view_name = st.radio(
+        "View",
+        options=["Today", "This Week", "All Tasks", "Done"],
+        horizontal=True,
+        label_visibility="collapsed",
+    )
+    render_v0_task_cards(v0_tasks_for_view(view_name), view_name)
+
+
+def render_pending_task_updates():
+    updates = get_pending_task_updates()
+    if not updates:
+        st.info("No pending deadline updates.")
+        return
+
+    for update in updates:
+        with st.container(border=True):
+            st.markdown(f"### {display_value(update.get('task_title'))}")
+            columns = st.columns(4)
+            columns[0].markdown(f"**Course**  \n{display_value(update.get('task_course'))}")
+            columns[1].markdown(f"**Current due**  \n{display_task_datetime(update.get('old_due_at'))}")
+            columns[2].markdown(f"**Proposed due**  \n{display_task_datetime(update.get('new_due_at'))}")
+            columns[3].markdown(f"**Confidence**  \n{display_value(update.get('confidence'))}")
+            st.markdown(f"**Reason**  \n{display_value(update.get('reason'))}")
+            st.markdown(f"**Source snippet**  \n{display_value(update.get('source_snippet'))}")
+
+            with st.expander("Edit proposed date before accepting"):
+                edited_due = st.text_input(
+                    "New due date",
+                    value=update.get("new_due_at") or "",
+                    key=f"edit-update-due-{update['id']}",
+                    placeholder="YYYY-MM-DD or YYYY-MM-DD HH:MM",
+                )
+                if st.button("Accept Edited Update", key=f"accept-edited-update-{update['id']}"):
+                    if accept_task_update(update["id"], edited_due):
+                        st.success("Task deadline updated.")
+                        st.rerun()
+                    st.error("Could not accept this update.")
+
+            actions = st.columns(2)
+            with actions[0]:
+                if st.button("Accept Update", key=f"accept-update-{update['id']}", type="primary"):
+                    if accept_task_update(update["id"]):
+                        st.success("Task deadline updated.")
+                        st.rerun()
+                    st.error("Could not accept this update.")
+            with actions[1]:
+                if st.button("Ignore Update", key=f"ignore-update-{update['id']}"):
+                    update_task_update_status(update["id"], "ignored")
+                    st.success("Update ignored.")
+                    st.rerun()
+
+
+def render_check_updates():
+    st.subheader("Check Updates")
+    st.caption(
+        "Paste a new announcement or changed course material. The app will flag "
+        "new tasks, possible duplicates, and possible deadline changes. Nothing "
+        "updates automatically."
+    )
+    title = st.text_input("Update title", placeholder="Example: Week 4 announcement")
+    raw_text = st.text_area("Announcement or updated material", height=260)
+
+    if st.button("Check for Updates", type="primary"):
+        raw_text = (raw_text or "").strip()
+        if not raw_text:
+            st.warning("Paste announcement text first.")
+            return
+
+        document_id = save_material_document(
+            title=title or "Course update",
+            document_type="announcement",
+            raw_text=raw_text,
+            file_type="text",
+        )
+        try:
+            extracted_tasks = extract_suggestions_from_material(raw_text, "announcement")
+        except Exception as error:
+            st.error(f"Could not check this update: {error}")
+            return
+
+        confirmed_tasks = active_confirmed_tasks()
+        new_count = 0
+        update_count = 0
+        duplicate_count = 0
+        for task in extracted_tasks:
+            match, score = find_possible_task_match(task, confirmed_tasks)
+            old_due = match.get("due_at") if match else None
+            new_due = task.get("due_at")
+            if match and new_due and date_key(old_due) != date_key(new_due):
+                create_task_update({
+                    "task_id": match["id"],
+                    "document_id": document_id,
+                    "old_due_at": old_due,
+                    "new_due_at": new_due,
+                    "source_snippet": task.get("source_snippet"),
+                    "confidence": task.get("confidence") or "medium",
+                    "reason": (
+                        f"Possible deadline change from announcement "
+                        f"({score:.0%} title match)."
+                    ),
+                })
+                update_count += 1
+            elif match:
+                duplicate_count += 1
+            else:
+                create_task(v0_task_payload(
+                    task,
+                    "announcement",
+                    f"New task suggestion from document #{document_id}.",
+                ))
+                new_count += 1
+
+        st.success(
+            f"Found {new_count} new task suggestions, "
+            f"{update_count} possible deadline updates, "
+            f"and {duplicate_count} likely duplicates."
+        )
+
+    st.markdown("### Pending Updates")
+    render_pending_task_updates()
+
+
 def file_extraction_key(filename, extracted_text):
     digest = hashlib.sha256(extracted_text.encode("utf-8")).hexdigest()
     return f"{filename}:{digest}"
@@ -4705,16 +5168,34 @@ def render_memory_workspace():
 
 def render_settings_workspace():
     st.subheader("Settings")
+    st.caption("Course Task Inbox keeps the main workflow small and review-first.")
+
     st.markdown("### Connections")
+    key_present, key_message = ai_chat_api_key_status()
     columns = st.columns(3)
-    columns[0].metric("OpenAI Key", "Yes" if has_openai_api_key() else "No")
+    columns[0].metric("OpenAI Key", "Yes" if key_present else "No")
     columns[1].metric("Canvas URL", "Yes" if has_canvas_base_url() else "No")
     columns[2].metric("Canvas Token", "Yes" if has_canvas_api_token() else "No")
+    if not key_present:
+        st.info(key_message)
 
-    with st.expander("Files / Syllabus Upload"):
-        render_file_upload()
-    with st.expander("Quercus Sync"):
-        render_quercus_sync()
+    st.markdown("### Product Scope")
+    st.write(
+        "The main app is now focused on adding course material, reviewing AI "
+        "suggestions, keeping confirmed tasks, and approving deadline updates."
+    )
+
+    with st.expander("Experimental / hidden old features", expanded=False):
+        st.warning(
+            "These older features are preserved for experiments, but they are "
+            "not part of the focused v0 Course Task Inbox."
+        )
+        experimental_options = [
+            option for option in EXPERIMENTAL_MENU_OPTIONS
+            if option != "Settings"
+        ]
+        choice = st.selectbox("Experimental page", experimental_options)
+        render_advanced_choice(choice)
 
 
 def render_advanced_workspace():
@@ -4764,29 +5245,28 @@ def render_advanced_choice(choice):
 
 def main():
     st.set_page_config(
-        page_title="Student Task Manager",
+        page_title="Course Task Inbox",
         page_icon="ST",
         layout="centered",
     )
     inject_calm_command_css()
-    st.title("Student Task Manager")
+    st.title("Course Task Inbox")
 
     init_db()
-    maybe_run_daily_quercus_refresh()
     show_pending_message()
 
     choice = st.sidebar.radio("Menu", MAIN_MENU_OPTIONS, label_visibility="collapsed")
 
-    if choice == "AI Boss Chat":
-        render_ai_boss_chat()
-    elif choice == "Today":
-        render_command_center()
-    elif choice == "Focus":
-        render_focus_session()
-    elif choice == "Review":
-        render_daily_review()
+    if choice == "Add Material":
+        render_add_material()
+    elif choice == "Review Suggestions":
+        render_review_suggestions()
+    elif choice == "Tasks":
+        render_v0_tasks()
+    elif choice == "Check Updates":
+        render_check_updates()
     else:
-        render_advanced_workspace()
+        render_settings_workspace()
 
 
 if __name__ == "__main__":

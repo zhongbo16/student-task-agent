@@ -101,6 +101,11 @@ def _normalize_ai_task(task, source):
     if confidence not in VALID_CONFIDENCES:
         confidence = "low"
 
+    reason = _clean_text(task.get("reason"))
+    notes = _clean_text(task.get("notes"))
+    if reason:
+        notes = f"{notes}\nReason: {reason}" if notes else f"Reason: {reason}"
+
     return {
         "title": _clean_text(task.get("title")) or "Untitled syllabus task",
         "course": _clean_text(task.get("course")),
@@ -109,10 +114,11 @@ def _normalize_ai_task(task, source):
         "source": source,
         "confidence": confidence,
         "due_at": _clean_date(task.get("due_at")),
+        "weight": _clean_text(task.get("weight")),
         "planned_date": _clean_date(task.get("planned_date")),
         "estimated_minutes": _clean_int(task.get("estimated_minutes")),
         "priority": _clean_priority(task.get("priority")),
-        "notes": _clean_text(task.get("notes")),
+        "notes": notes,
         "source_snippet": _clean_text(task.get("source_snippet")),
     }
 
@@ -150,7 +156,7 @@ def extract_tasks_from_text(text, source="syllabus"):
             {
                 "role": "system",
                 "content": (
-                    "You extract possible student tasks from syllabus text. "
+                    "You extract possible student tasks from course material. "
                     "Return only structured JSON with a top-level tasks array. "
                     "Never invent deadlines. Use null when a date is unclear. "
                     "Every task status must be suggested."
@@ -161,7 +167,7 @@ def extract_tasks_from_text(text, source="syllabus"):
                 "content": (
                     "Extract possible assignments, exams, quizzes, readings, "
                     "project milestones, participation requirements, and tutorial "
-                    "preparation tasks from this syllabus text.\n\n"
+                    "preparation tasks from this course material.\n\n"
                     "Return JSON in this shape:\n"
                     "{\n"
                     '  "tasks": [\n'
@@ -170,13 +176,15 @@ def extract_tasks_from_text(text, source="syllabus"):
                     '      "course": "string or null",\n'
                     '      "task_type": "assignment|exam|quiz|reading|project|participation|tutorial_preparation|other",\n'
                     '      "status": "suggested",\n'
-                    '      "source": "syllabus",\n'
+                    '      "source": "source type string",\n'
                     '      "confidence": "high|medium|low",\n'
                     '      "due_at": "YYYY-MM-DD or null",\n'
+                    '      "weight": "string or null",\n'
                     '      "planned_date": "YYYY-MM-DD or null",\n'
                     '      "estimated_minutes": "integer or null",\n'
                     '      "priority": "1-5 integer or null",\n'
                     '      "notes": "string or null",\n'
+                    '      "reason": "string or null",\n'
                     '      "source_snippet": "short supporting quote or null"\n'
                     "    }\n"
                     "  ]\n"
@@ -187,7 +195,8 @@ def extract_tasks_from_text(text, source="syllabus"):
                     "- Use high confidence only when the task and date/details are clear.\n"
                     "- Use medium or low confidence for vague tasks.\n"
                     "- Do not include administrative notes that are not student tasks.\n\n"
-                    f"Syllabus text:\n{prompt_text}"
+                    f"Source type: {source}\n\n"
+                    f"Course material:\n{prompt_text}"
                 ),
             },
         ],

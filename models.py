@@ -13,6 +13,7 @@ TASK_COLUMNS = (
     "course",
     "task_type",
     "due_at",
+    "weight",
     "planned_date",
     "estimated_minutes",
     "priority",
@@ -48,6 +49,7 @@ class Task:
     course: Optional[str] = None
     task_type: Optional[str] = None
     due_at: Optional[str] = None
+    weight: Optional[str] = None
     planned_date: Optional[str] = None
     estimated_minutes: Optional[int] = None
     priority: int = 3
@@ -167,6 +169,7 @@ def normalize_task(task):
         "course": _clean_text(task.get("course")),
         "task_type": _clean_text(task.get("task_type")),
         "due_at": _clean_date(task.get("due_at")),
+        "weight": _clean_text(task.get("weight")),
         "planned_date": _clean_date(task.get("planned_date")),
         "estimated_minutes": estimated_minutes,
         "priority": priority,
