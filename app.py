@@ -3648,6 +3648,27 @@ def save_material_document(title, document_type, raw_text, filename=None, file_t
     })
 
 
+def v0_status_counts():
+    tasks = get_all_tasks()
+    return {
+        "pending_suggestions": sum(
+            1 for task in tasks if task.get("status") == "suggested"
+        ),
+        "confirmed_tasks": sum(
+            1 for task in tasks if task.get("status") in ("confirmed", "in_progress")
+        ),
+        "pending_updates": len(get_pending_task_updates()),
+    }
+
+
+def render_v0_status_metrics():
+    counts = v0_status_counts()
+    columns = st.columns(3)
+    columns[0].metric("Pending suggestions", counts["pending_suggestions"])
+    columns[1].metric("Confirmed tasks", counts["confirmed_tasks"])
+    columns[2].metric("Pending updates", counts["pending_updates"])
+
+
 def render_suggestion_summary(task):
     columns = st.columns(4)
     columns[0].markdown(f"**Course**  \n{display_value(task.get('course'))}")
@@ -3666,7 +3687,7 @@ def render_suggestion_summary(task):
 
 
 def render_suggestion_edit_form(task):
-    with st.expander("Edit before confirming"):
+    with st.expander("Edit"):
         with st.form(f"edit-suggestion-{task['id']}"):
             title = st.text_input("Title", value=task.get("title") or "")
             course = st.text_input("Course", value=task.get("course") or "")
@@ -3689,7 +3710,7 @@ def render_suggestion_edit_form(task):
                 "Source snippet",
                 value=task.get("source_snippet") or "",
             )
-            submitted = st.form_submit_button("Save Edits")
+            submitted = st.form_submit_button("Save Edit")
 
         if submitted:
             try:
@@ -3716,12 +3737,15 @@ def render_suggestion_edit_form(task):
 def render_review_suggestions():
     st.subheader("Review Suggestions")
     st.caption(
-        "AI suggestions stay here until you confirm or ignore them. "
-        "Use the source snippet to verify each item."
+        "AI suggestions are not official tasks yet. Confirm, edit, or "
+        "ignore each one."
     )
     suggestions = sort_tasks_for_dashboard(get_tasks_by_status("suggested"), "All Tasks")
     if not suggestions:
-        st.info("No pending suggestions. Add course material to create suggestions.")
+        st.info("No suggestions waiting for review. Add course material to extract tasks.")
+        if st.button("Add Material", key="empty-review-add-material"):
+            st.session_state.pending_nav = "Add Material"
+            st.rerun()
         return
 
     for task in suggestions:
@@ -3731,7 +3755,7 @@ def render_review_suggestions():
             render_suggestion_edit_form(task)
             columns = st.columns(2)
             with columns[0]:
-                if st.button("Confirm", key=f"v0-confirm-{task['id']}", type="primary"):
+                if st.button("Confirm Task", key=f"v0-confirm-{task['id']}", type="primary"):
                     update_task_status(task["id"], "confirmed")
                     st.success("Task confirmed.")
                     st.rerun()
@@ -3743,11 +3767,13 @@ def render_review_suggestions():
 
 
 def render_add_material():
-    st.subheader("Add Material")
+    st.subheader("Turn course material into reviewable tasks")
     st.caption(
-        "Upload a PDF or paste course text. The app extracts suggestions only; "
-        "you decide what becomes a confirmed task."
+        "Upload a syllabus, assignment sheet, or announcement. The app will "
+        "extract possible tasks, then you confirm what should go into your "
+        "dashboard."
     )
+    render_v0_status_metrics()
 
     document_type = st.selectbox("Material type", DOCUMENT_TYPES)
     title = st.text_input("Title", placeholder="Example: STA457 syllabus")
@@ -3758,7 +3784,7 @@ def render_add_material():
         height=240,
     )
 
-    if st.button("Extract Suggestions", type="primary"):
+    if st.button("Extract Task Suggestions", type="primary"):
         raw_text = (pasted_text or "").strip()
         filename = None
         file_type = None
@@ -3812,11 +3838,14 @@ def render_add_material():
             saved_count += 1
 
         st.success(
-            f"Saved {saved_count} suggestions for review."
+            f"Created {saved_count} suggestions. Review them before adding "
+            "them to your task dashboard."
             + (f" Skipped {duplicate_count} likely duplicates." if duplicate_count else "")
         )
         if saved_count:
-            st.info("Open Review Suggestions to confirm, edit, or ignore them.")
+            if st.button("Review Suggestions", key="after-extraction-review"):
+                st.session_state.pending_nav = "Review Suggestions"
+                st.rerun()
 
 
 def active_confirmed_tasks():
@@ -3863,22 +3892,28 @@ def v0_tasks_for_view(view_name):
 
 def render_v0_task_cards(tasks, view_name):
     if not tasks:
-        st.info("No tasks in this view.")
+        if view_name == "All Tasks":
+            st.info("No confirmed tasks yet. Review AI suggestions to build your task dashboard.")
+        else:
+            st.info("No confirmed tasks in this view.")
         return
 
     for task in tasks:
         with st.container(border=True):
             st.markdown(f"### {display_value(task.get('title'))}")
-            columns = st.columns(4)
+            columns = st.columns(5)
             columns[0].markdown(f"**Course**  \n{display_value(task.get('course'))}")
             columns[1].markdown(f"**Type**  \n{display_value(task.get('task_type'))}")
             columns[2].markdown(f"**Due**  \n{display_task_datetime(task.get('due_at'))}")
             columns[3].markdown(f"**Weight**  \n{display_value(task.get('weight'))}")
+            columns[4].markdown(f"**Status**  \n{display_value(task.get('status'))}")
             if task.get("source_snippet"):
-                with st.expander("Source snippet"):
+                with st.expander("Details"):
                     st.write(task["source_snippet"])
-            with st.expander("Details"):
                 render_task_fields(task)
+            else:
+                with st.expander("Details"):
+                    render_task_fields(task)
             if task.get("status") == "done":
                 if st.button("Reopen", key=f"v0-reopen-{task['id']}"):
                     update_task_status(task["id"], "confirmed")
@@ -3891,7 +3926,7 @@ def render_v0_task_cards(tasks, view_name):
 
 def render_v0_tasks():
     st.subheader("Tasks")
-    st.caption("Confirmed course tasks live here after you approve suggestions.")
+    st.caption("These are confirmed tasks you approved.")
     view_name = st.radio(
         "View",
         options=["Today", "This Week", "All Tasks", "Done"],
@@ -3904,12 +3939,12 @@ def render_v0_tasks():
 def render_pending_task_updates():
     updates = get_pending_task_updates()
     if not updates:
-        st.info("No pending deadline updates.")
+        st.info("No pending updates. Paste a new announcement to check for task changes.")
         return
 
     for update in updates:
         with st.container(border=True):
-            st.markdown(f"### {display_value(update.get('task_title'))}")
+            st.markdown(f"### Matched existing task: {display_value(update.get('task_title'))}")
             columns = st.columns(4)
             columns[0].markdown(f"**Course**  \n{display_value(update.get('task_course'))}")
             columns[1].markdown(f"**Current due**  \n{display_task_datetime(update.get('old_due_at'))}")
@@ -3918,14 +3953,14 @@ def render_pending_task_updates():
             st.markdown(f"**Reason**  \n{display_value(update.get('reason'))}")
             st.markdown(f"**Source snippet**  \n{display_value(update.get('source_snippet'))}")
 
-            with st.expander("Edit proposed date before accepting"):
+            with st.expander("Edit Proposed Date"):
                 edited_due = st.text_input(
                     "New due date",
                     value=update.get("new_due_at") or "",
                     key=f"edit-update-due-{update['id']}",
                     placeholder="YYYY-MM-DD or YYYY-MM-DD HH:MM",
                 )
-                if st.button("Accept Edited Update", key=f"accept-edited-update-{update['id']}"):
+                if st.button("Accept Edited Deadline Update", key=f"accept-edited-update-{update['id']}"):
                     if accept_task_update(update["id"], edited_due):
                         st.success("Task deadline updated.")
                         st.rerun()
@@ -3933,7 +3968,7 @@ def render_pending_task_updates():
 
             actions = st.columns(2)
             with actions[0]:
-                if st.button("Accept Update", key=f"accept-update-{update['id']}", type="primary"):
+                if st.button("Accept Deadline Update", key=f"accept-update-{update['id']}", type="primary"):
                     if accept_task_update(update["id"]):
                         st.success("Task deadline updated.")
                         st.rerun()
@@ -3946,16 +3981,16 @@ def render_pending_task_updates():
 
 
 def render_check_updates():
-    st.subheader("Check Updates")
+    st.subheader("Check for Course Updates")
     st.caption(
-        "Paste a new announcement or changed course material. The app will flag "
-        "new tasks, possible duplicates, and possible deadline changes. Nothing "
-        "updates automatically."
+        "Paste a new announcement or updated course material. The app will flag "
+        "new tasks and possible deadline changes. Nothing changes until you "
+        "approve it."
     )
     title = st.text_input("Update title", placeholder="Example: Week 4 announcement")
     raw_text = st.text_area("Announcement or updated material", height=260)
 
-    if st.button("Check for Updates", type="primary"):
+    if st.button("Check for New Tasks or Deadline Changes", type="primary"):
         raw_text = (raw_text or "").strip()
         if not raw_text:
             st.warning("Paste announcement text first.")
@@ -5172,10 +5207,8 @@ def render_settings_workspace():
 
     st.markdown("### Connections")
     key_present, key_message = ai_chat_api_key_status()
-    columns = st.columns(3)
+    columns = st.columns(1)
     columns[0].metric("OpenAI Key", "Yes" if key_present else "No")
-    columns[1].metric("Canvas URL", "Yes" if has_canvas_base_url() else "No")
-    columns[2].metric("Canvas Token", "Yes" if has_canvas_api_token() else "No")
     if not key_present:
         st.info(key_message)
 
@@ -5185,11 +5218,22 @@ def render_settings_workspace():
         "suggestions, keeping confirmed tasks, and approving deadline updates."
     )
 
-    with st.expander("Experimental / hidden old features", expanded=False):
+    with st.expander("Developer / Experimental", expanded=False):
+        show_experimental = st.checkbox("Show hidden experimental pages")
+        if not show_experimental:
+            st.caption(
+                "Hidden pages are preserved for development only. They are not "
+                "part of the v0 Course Task Inbox workflow."
+            )
+            return
+
         st.warning(
-            "These older features are preserved for experiments, but they are "
-            "not part of the focused v0 Course Task Inbox."
+            "Experimental pages may contain older non-v0 workflows. Use them "
+            "only for development."
         )
+        status_columns = st.columns(2)
+        status_columns[0].metric("Canvas URL", "Yes" if has_canvas_base_url() else "No")
+        status_columns[1].metric("Canvas Token", "Yes" if has_canvas_api_token() else "No")
         experimental_options = [
             option for option in EXPERIMENTAL_MENU_OPTIONS
             if option != "Settings"
@@ -5255,7 +5299,16 @@ def main():
     init_db()
     show_pending_message()
 
-    choice = st.sidebar.radio("Menu", MAIN_MENU_OPTIONS, label_visibility="collapsed")
+    pending_nav = st.session_state.pop("pending_nav", None)
+    if pending_nav in MAIN_MENU_OPTIONS:
+        st.session_state.main_menu = pending_nav
+
+    choice = st.sidebar.radio(
+        "Menu",
+        MAIN_MENU_OPTIONS,
+        key="main_menu",
+        label_visibility="collapsed",
+    )
 
     if choice == "Add Material":
         render_add_material()
