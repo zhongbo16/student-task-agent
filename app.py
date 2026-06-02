@@ -3670,20 +3670,66 @@ def render_v0_status_metrics():
 
 
 def render_suggestion_summary(task):
-    columns = st.columns(4)
-    columns[0].markdown(f"**Course**  \n{display_value(task.get('course'))}")
-    columns[1].markdown(f"**Type**  \n{display_value(task.get('task_type'))}")
-    columns[2].markdown(f"**Due**  \n{display_task_datetime(task.get('due_at'))}")
-    columns[3].markdown(f"**Confidence**  \n{display_value(task.get('confidence'))}")
+    visible_fields = [
+        ("Course", task.get("course")),
+        ("Type", task.get("task_type")),
+        ("Due", display_task_datetime(task.get("due_at"))),
+    ]
+    if task.get("weight"):
+        visible_fields.append(("Weight", task.get("weight")))
 
-    more = st.columns(3)
-    more[0].markdown(f"**Weight**  \n{display_value(task.get('weight'))}")
-    more[1].markdown(f"**Status**  \n{display_value(task.get('status'))}")
-    more[2].markdown(f"**Source**  \n{display_value(task.get('source'))}")
+    columns = st.columns(len(visible_fields))
+    for index, (label, value) in enumerate(visible_fields):
+        columns[index].markdown(f"**{label}**  \n{display_value(value)}")
 
-    if task.get("notes"):
-        st.markdown(f"**Reason / Notes**  \n{display_value(task.get('notes'))}")
-    st.markdown(f"**Source snippet**  \n{display_value(task.get('source_snippet'))}")
+    with st.expander("Why AI suggested this"):
+        detail_columns = st.columns(3)
+        detail_columns[0].markdown(
+            f"**Confidence**  \n{display_value(task.get('confidence'))}"
+        )
+        detail_columns[1].markdown(
+            f"**Status**  \n{display_value(task.get('status'))}"
+        )
+        detail_columns[2].markdown(
+            f"**Source**  \n{display_value(task.get('source'))}"
+        )
+        if task.get("notes"):
+            st.markdown(f"**Notes**  \n{display_value(task.get('notes'))}")
+        st.markdown(
+            f"**Source snippet**  \n{display_value(task.get('source_snippet'))}"
+        )
+
+
+def render_manual_task_fallback():
+    with st.expander("Add one task manually"):
+        with st.form("manual-v0-task-form"):
+            title = st.text_input("Task title")
+            course = st.text_input("Course")
+            task_type = st.text_input("Task type")
+            due_at = st.date_input("Due date")
+            submitted = st.form_submit_button("Create Confirmed Task")
+
+        if submitted:
+            if not title.strip():
+                st.warning("Task title is required.")
+                return
+
+            try:
+                create_task({
+                    "title": title,
+                    "course": course,
+                    "task_type": task_type,
+                    "due_at": due_at,
+                    "status": "confirmed",
+                    "source": "manual",
+                })
+            except ValueError as error:
+                st.error(str(error))
+            else:
+                st.success("Confirmed task created. Open Tasks to see it.")
+                if st.button("Open Tasks", key="manual-task-open-tasks"):
+                    st.session_state.pending_nav = "Tasks"
+                    st.rerun()
 
 
 def render_suggestion_edit_form(task):
@@ -3846,6 +3892,8 @@ def render_add_material():
             if st.button("Review Suggestions", key="after-extraction-review"):
                 st.session_state.pending_nav = "Review Suggestions"
                 st.rerun()
+
+    render_manual_task_fallback()
 
 
 def active_confirmed_tasks():
