@@ -577,6 +577,94 @@ def inject_calm_command_css():
             font-weight: 700;
             line-height: 1.35;
         }
+
+        .calendar-grid {
+            display: grid;
+            grid-template-columns: repeat(7, minmax(0, 1fr));
+            gap: 0.65rem;
+            margin: 0.75rem 0 1rem;
+        }
+
+        .calendar-day-card {
+            min-height: 148px;
+            background: #FFFFFF;
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 0.65rem;
+            box-shadow: 0 1px 2px rgba(31, 41, 51, 0.04);
+        }
+
+        .calendar-day-card-today {
+            border-color: rgba(37, 99, 235, 0.45);
+            box-shadow: 0 0 0 1px rgba(37, 99, 235, 0.16);
+        }
+
+        .calendar-weekday {
+            color: var(--text-muted);
+            font-size: 0.72rem;
+            font-weight: 750;
+            text-transform: uppercase;
+        }
+
+        .calendar-date {
+            color: var(--text-main);
+            font-size: 1.25rem;
+            font-weight: 760;
+            line-height: 1.2;
+            margin: 0.12rem 0 0.45rem;
+        }
+
+        .calendar-pill {
+            border-radius: 6px;
+            border: 1px solid rgba(37, 99, 235, 0.16);
+            background: rgba(37, 99, 235, 0.07);
+            color: var(--text-main);
+            font-size: 0.74rem;
+            line-height: 1.25;
+            padding: 0.32rem 0.38rem;
+            margin-top: 0.35rem;
+            overflow-wrap: anywhere;
+        }
+
+        .calendar-pill-time {
+            color: var(--primary);
+            font-weight: 760;
+            margin-right: 0.22rem;
+        }
+
+        .calendar-pill-course {
+            color: var(--text-muted);
+            display: block;
+            font-size: 0.68rem;
+            margin-top: 0.12rem;
+        }
+
+        .calendar-empty {
+            color: var(--text-muted);
+            font-size: 0.78rem;
+            margin-top: 0.6rem;
+        }
+
+        .past-deadline-strip {
+            background: rgba(185, 28, 28, 0.06);
+            border: 1px solid rgba(185, 28, 28, 0.18);
+            border-radius: 8px;
+            padding: 0.8rem;
+            margin: 0.75rem 0 1rem;
+        }
+
+        .past-deadline-title {
+            color: var(--critical);
+            font-weight: 760;
+            margin-bottom: 0.45rem;
+        }
+
+        .past-deadline-item {
+            color: var(--text-secondary);
+            font-size: 0.85rem;
+            line-height: 1.45;
+            margin: 0.18rem 0;
+        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -4039,7 +4127,7 @@ def calendar_task_sort_key(task):
 
 def v0_calendar_groups(days=14):
     today = date.today()
-    end_date = today + timedelta(days=days)
+    end_date = today + timedelta(days=days - 1)
     tasks = [
         task for task in get_all_tasks()
         if task.get("status") in ("confirmed", "in_progress", "done")
@@ -4049,7 +4137,7 @@ def v0_calendar_groups(days=14):
     past_deadlines = []
     upcoming = {
         today + timedelta(days=offset): []
-        for offset in range(days + 1)
+        for offset in range(days)
     }
     for task in tasks:
         due_date = parse_timeline_date(task.get("due_at"))
@@ -4072,6 +4160,82 @@ def v0_calendar_groups(days=14):
     }
 
 
+def calendar_pill_html(task):
+    title = escape_html(task.get("title"))
+    course = escape_html(task.get("course"))
+    time_label = escape_html(display_task_time(task.get("due_at")))
+    status = escape_html(task.get("status"))
+    return (
+        '<div class="calendar-pill">'
+        f'<span class="calendar-pill-time">{time_label}</span>'
+        f'{title}'
+        f'<span class="calendar-pill-course">{course} | {status}</span>'
+        '</div>'
+    )
+
+
+def render_past_deadlines_overview(tasks):
+    if not tasks:
+        st.info("No past deadlines.")
+        return
+
+    visible_tasks = tasks[:8]
+    items_html = "".join(
+        (
+            '<div class="past-deadline-item">'
+            f'{escape_html(display_task_datetime(task.get("due_at")))} | '
+            f'{escape_html(task.get("course"))} | '
+            f'{escape_html(task.get("title"))}'
+            '</div>'
+        )
+        for task in visible_tasks
+    )
+    if len(tasks) > len(visible_tasks):
+        items_html += (
+            '<div class="past-deadline-item">'
+            f'+ {len(tasks) - len(visible_tasks)} more past deadline(s)'
+            '</div>'
+        )
+
+    st.markdown(
+        (
+            '<div class="past-deadline-strip">'
+            '<div class="past-deadline-title">Past Deadlines</div>'
+            f'{items_html}'
+            '</div>'
+        ),
+        unsafe_allow_html=True,
+    )
+
+
+def render_calendar_grid(upcoming):
+    today = date.today()
+    cells = []
+    for day, day_tasks in upcoming:
+        card_class = "calendar-day-card"
+        if day == today:
+            card_class += " calendar-day-card-today"
+
+        tasks_html = "".join(calendar_pill_html(task) for task in day_tasks)
+        if not tasks_html:
+            tasks_html = '<div class="calendar-empty">No tasks</div>'
+
+        cells.append(
+            (
+                f'<div class="{card_class}">'
+                f'<div class="calendar-weekday">{escape_html(day.strftime("%a"))}</div>'
+                f'<div class="calendar-date">{day.day}</div>'
+                f'{tasks_html}'
+                '</div>'
+            )
+        )
+
+    st.markdown(
+        f'<div class="calendar-grid">{"".join(cells)}</div>',
+        unsafe_allow_html=True,
+    )
+
+
 def render_calendar_task_item(task, key_prefix):
     with st.container(border=True):
         st.markdown(f"### {display_value(task.get('title'))}")
@@ -4092,29 +4256,25 @@ def render_calendar_task_item(task, key_prefix):
 def render_v0_calendar():
     st.markdown("### Calendar")
     st.caption(
-        "Confirmed and in-progress tasks grouped by due date for the next 14 days."
+        "A visual two-week view of confirmed and in-progress course deadlines."
     )
     groups = v0_calendar_groups(days=14)
 
-    st.markdown("### Past Deadlines")
-    if groups["past_deadlines"]:
-        for task in groups["past_deadlines"]:
-            render_calendar_task_item(task, "Calendar Past Deadlines")
-    else:
-        st.info("No past deadlines.")
+    render_past_deadlines_overview(groups["past_deadlines"])
+    render_calendar_grid(groups["upcoming"])
 
-    st.markdown("### Next 14 Days")
-    has_upcoming = False
-    for day, day_tasks in groups["upcoming"]:
-        if not day_tasks:
-            continue
-        has_upcoming = True
-        st.markdown(f"#### {timeline_day_label(day)}")
-        for task in day_tasks:
-            render_calendar_task_item(task, f"Calendar {day.isoformat()}")
+    action_tasks = []
+    for _, day_tasks in groups["upcoming"]:
+        action_tasks.extend(day_tasks)
 
-    if not has_upcoming:
+    if not action_tasks:
         st.info("No confirmed or in-progress tasks due in the next 14 days.")
+        return
+
+    with st.expander("Task actions"):
+        st.caption("Use this section to edit dates or mark tasks done.")
+        for task in action_tasks:
+            render_calendar_task_item(task, "Calendar Actions")
 
 
 def render_v0_tasks():
