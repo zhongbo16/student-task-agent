@@ -1260,6 +1260,76 @@ def update_task_status(task_id, status):
         update_task_urgency(task_id, urgency_score, urgency_label)
 
 
+AUTO_FINISH_NOTE = (
+    "Automatically finished after the due date passed; user did not specify "
+    "a reason."
+)
+
+
+def _due_date_has_passed(value, now=None):
+    if not value:
+        return False
+
+    now = now or datetime.now(LOCAL_TIMEZONE)
+    text = str(value).strip()
+    if not text:
+        return False
+
+    includes_time = len(text) > 10 and (":" in text[10:] or "T" in text[10:])
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        parsed = None
+
+    if parsed is not None:
+        if not includes_time:
+            return parsed.date() < now.date()
+        if parsed.tzinfo is not None:
+            parsed = parsed.astimezone(LOCAL_TIMEZONE)
+            return parsed <= now
+        return parsed <= now.replace(tzinfo=None)
+
+    try:
+        parsed_date = datetime.strptime(text[:10], "%Y-%m-%d").date()
+    except ValueError:
+        return False
+    return parsed_date < now.date()
+
+
+def auto_finish_past_due_tasks():
+    now = datetime.now(LOCAL_TIMEZONE)
+    now_stamp = datetime.now().isoformat(timespec="seconds")
+    tasks = _fetch_tasks(
+        "WHERE status IN ('confirmed', 'in_progress') AND due_at IS NOT NULL"
+    )
+    past_due_tasks = [
+        task for task in tasks
+        if _due_date_has_passed(task.get("due_at"), now)
+    ]
+    if not past_due_tasks:
+        return 0
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        for task in past_due_tasks:
+            notes = task.get("notes") or ""
+            if AUTO_FINISH_NOTE not in notes:
+                notes = f"{notes}\n{AUTO_FINISH_NOTE}".strip()
+            cursor.execute(
+                '''
+                UPDATE tasks
+                SET status = 'done',
+                    needs_review = 0,
+                    notes = ?,
+                    updated_at = ?
+                WHERE id = ?
+                ''',
+                (notes, now_stamp, task["id"]),
+            )
+        conn.commit()
+    return len(past_due_tasks)
+
+
 def update_task_fields(task_id, updates):
     allowed_fields = {
         "title",

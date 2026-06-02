@@ -63,6 +63,7 @@ from question_coach import (
 from db import (
     archive_course,
     accept_task_update,
+    auto_finish_past_due_tasks,
     clear_chat_history,
     complete_study_session,
     create_agent_memory,
@@ -3938,6 +3939,26 @@ def v0_tasks_for_view(view_name):
     return sort_tasks_for_dashboard(tasks, view_name)
 
 
+def render_due_date_editor(task, view_name):
+    with st.expander("Edit due date"):
+        with st.form(f"edit-due-date-{view_key(view_name)}-{task['id']}"):
+            due_at = st.text_input(
+                "Due date",
+                value=task.get("due_at") or "",
+                placeholder="YYYY-MM-DD or YYYY-MM-DD HH:MM. Leave blank to clear.",
+            )
+            submitted = st.form_submit_button("Save Due Date")
+
+        if submitted:
+            try:
+                update_task_fields(task["id"], {"due_at": due_at})
+            except ValueError as error:
+                st.error(str(error))
+            else:
+                st.success("Due date updated.")
+                st.rerun()
+
+
 def render_v0_task_cards(tasks, view_name):
     if not tasks:
         if not active_confirmed_tasks() or view_name == "All Tasks":
@@ -3972,6 +3993,7 @@ def render_v0_task_cards(tasks, view_name):
                     st.markdown("**Source snippet**")
                     st.write(task["source_snippet"])
                 render_task_fields(task)
+            render_due_date_editor(task, view_name)
             if task.get("status") == "done":
                 if st.button("Reopen", key=f"v0-reopen-{task['id']}"):
                     update_task_status(task["id"], "confirmed")
@@ -5363,6 +5385,12 @@ def main():
     st.title("Course Task Inbox")
 
     init_db()
+    auto_finished_count = auto_finish_past_due_tasks()
+    if auto_finished_count:
+        st.info(
+            f"Automatically finished {auto_finished_count} past-due task(s). "
+            "Reason saved: user did not specify a reason."
+        )
     show_pending_message()
 
     pending_nav = st.session_state.pop("pending_nav", None)
