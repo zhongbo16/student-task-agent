@@ -52,6 +52,7 @@ VALID_COMMITMENT_TYPES = (
     "personal",
     "other",
 )
+VALID_COURSE_GRADE_TYPES = ("final", "current", "midterm", "assignment_avg", "other")
 VALID_MEMORY_CANDIDATE_DECISIONS = ("pending", "accepted", "ignored", "duplicate")
 VALID_BEHAVIOR_ENERGY_LEVELS = ("low", "medium", "high")
 VALID_COGNITIVE_LOADS = ("shallow", "medium", "deep")
@@ -333,6 +334,30 @@ def _create_course_archives_table(cursor):
             archived_at TEXT,
             created_at TEXT,
             updated_at TEXT
+        )
+    ''')
+
+
+def _create_course_grades_table(cursor):
+    allowed_types = "', '".join(VALID_COURSE_GRADE_TYPES)
+    cursor.execute(f'''
+        CREATE TABLE IF NOT EXISTS course_grades (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            course TEXT NOT NULL,
+            course_key TEXT NOT NULL,
+            term TEXT NOT NULL DEFAULT '',
+            grade TEXT,
+            grade_percent REAL CHECK (
+                grade_percent IS NULL
+                OR (grade_percent >= 0 AND grade_percent <= 100)
+            ),
+            grade_type TEXT CHECK (
+                grade_type IS NULL OR grade_type IN ('{allowed_types}')
+            ),
+            notes TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            UNIQUE(course_key, term)
         )
     ''')
 
@@ -864,6 +889,7 @@ def init_db():
         _create_study_sessions_table(cursor)
         _create_task_candidates_table(cursor)
         _create_course_archives_table(cursor)
+        _create_course_grades_table(cursor)
         _create_morning_checkins_table(cursor)
         _create_personal_commitments_table(cursor)
         _create_daily_commands_table(cursor)
@@ -3468,6 +3494,90 @@ def _clean_course_name(value):
 
 def _course_key(value):
     return _clean_course_name(value).casefold()
+
+
+def _clean_grade_percent(value):
+    if value in (None, ""):
+        return None
+    try:
+        percent = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError("Grade percent must be a number between 0 and 100.") from error
+    if percent < 0 or percent > 100:
+        raise ValueError("Grade percent must be between 0 and 100.")
+    return percent
+
+
+def create_or_update_course_grade(record):
+    course_name = _clean_course_name(record.get("course"))
+    if course_name == "No course":
+        raise ValueError("Course is required.")
+
+    grade_type = record.get("grade_type") or "final"
+    if grade_type not in VALID_COURSE_GRADE_TYPES:
+        raise ValueError(
+            f"Grade type must be one of: {', '.join(VALID_COURSE_GRADE_TYPES)}"
+        )
+
+    term = str(record.get("term") or "").strip()
+    grade = str(record.get("grade") or "").strip() or None
+    grade_percent = _clean_grade_percent(record.get("grade_percent"))
+    notes = str(record.get("notes") or "").strip() or None
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO course_grades (
+                course, course_key, term, grade, grade_percent, grade_type,
+                notes, created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(course_key, term) DO UPDATE SET
+                course = excluded.course,
+                grade = excluded.grade,
+                grade_percent = excluded.grade_percent,
+                grade_type = excluded.grade_type,
+                notes = excluded.notes,
+                updated_at = excluded.updated_at
+            ''',
+            (
+                course_name,
+                _course_key(course_name),
+                term,
+                grade,
+                grade_percent,
+                grade_type,
+                notes,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_course_grades():
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, course, course_key, term, grade, grade_percent,
+                   grade_type, notes, created_at, updated_at
+            FROM course_grades
+            ORDER BY course ASC, term DESC, updated_at DESC
+            '''
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def delete_course_grade(grade_id):
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM course_grades WHERE id = ?", (grade_id,))
+        conn.commit()
+        return cursor.rowcount > 0
 
 
 def _normalize_candidate(candidate):

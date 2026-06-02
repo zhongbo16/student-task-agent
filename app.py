@@ -72,6 +72,7 @@ from db import (
     create_command_center_message,
     create_or_update_morning_checkin,
     create_or_update_behavior_plan,
+    create_or_update_course_grade,
     create_or_update_daily_refresh_run,
     create_or_update_daily_review,
     create_personal_commitment,
@@ -81,6 +82,7 @@ from db import (
     create_canvas_assignment_task,
     create_study_session_start,
     deactivate_agent_memory,
+    delete_course_grade,
     export_daily_reviews_to_csv,
     get_active_study_session,
     get_active_agent_memory,
@@ -94,6 +96,7 @@ from db import (
     get_latest_ai_boss_briefing,
     get_behavior_plan_by_date,
     get_course_summaries,
+    get_course_grades,
     get_morning_checkin_by_date,
     get_pending_agent_memory_candidates,
     get_pending_task_updates,
@@ -3838,14 +3841,13 @@ def import_current_quercus_assignments():
         "no_due_date_skipped": 0,
         "errors": list(summary.get("errors", [])),
     }
-    today = date.today()
+    existing_tasks = get_all_tasks()
 
     for assignment in assignments:
-        due_date = parse_timeline_date(assignment.get("due_at"))
-        if not due_date:
+        if not assignment.get("due_at"):
             stats["no_due_date_skipped"] += 1
             continue
-        if due_date < today:
+        if not quercus_due_is_current_or_future(assignment.get("due_at")):
             stats["past_due_skipped"] += 1
             continue
 
@@ -3854,13 +3856,60 @@ def import_current_quercus_assignments():
         if task_exists_by_external_id(external_source, external_id):
             stats["duplicates_skipped"] += 1
             continue
+        if quercus_assignment_has_existing_match(assignment, existing_tasks):
+            stats["duplicates_skipped"] += 1
+            continue
 
         if create_canvas_assignment_task(assignment):
             stats["imported"] += 1
+            existing_tasks = get_all_tasks()
         else:
             stats["duplicates_skipped"] += 1
 
     return stats
+
+
+def quercus_due_is_current_or_future(value):
+    if not value:
+        return False
+
+    text = str(value).strip()
+    if not text:
+        return False
+
+    includes_time = len(text) > 10 and (":" in text[10:] or "T" in text[10:])
+    if not includes_time:
+        due_date = parse_timeline_date(text)
+        return bool(due_date and due_date >= datetime.now(LOCAL_TIMEZONE).date())
+
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        due_date = parse_timeline_date(text)
+        return bool(due_date and due_date >= datetime.now(LOCAL_TIMEZONE).date())
+
+    now = datetime.now(LOCAL_TIMEZONE)
+    if parsed.tzinfo is not None:
+        return parsed.astimezone(LOCAL_TIMEZONE) > now
+    return parsed > now.replace(tzinfo=None)
+
+
+def quercus_assignment_has_existing_match(assignment, existing_tasks):
+    match, score = find_possible_task_match(
+        {
+            "title": assignment.get("title"),
+            "course": assignment.get("course_name"),
+            "task_type": "assignment",
+            "due_at": assignment.get("due_at"),
+        },
+        existing_tasks,
+        threshold=0.9,
+    )
+    return bool(
+        match
+        and score >= 0.9
+        and date_key(match.get("due_at")) == date_key(assignment.get("due_at"))
+    )
 
 
 def render_quercus_assignment_import():
@@ -5626,6 +5675,93 @@ def render_memory_workspace():
         render_daily_review()
 
 
+def render_course_grade_profile():
+    with st.expander("Course Grade Profile", expanded=False):
+        st.caption(
+            "Optional local record of previous or current course grades. "
+            "This is stored in SQLite only and is not imported from Quercus."
+        )
+
+        with st.form("course-grade-profile-form"):
+            course = st.text_input("Course", placeholder="Example: STA457")
+            term = st.text_input("Term", placeholder="Example: Winter 2026")
+            grade_columns = st.columns(3)
+            grade = grade_columns[0].text_input("Grade", placeholder="Example: A-")
+            grade_percent = grade_columns[1].text_input(
+                "Percent",
+                placeholder="Example: 84",
+            )
+            grade_type = grade_columns[2].selectbox(
+                "Record type",
+                options=[
+                    "final",
+                    "current",
+                    "midterm",
+                    "assignment_avg",
+                    "other",
+                ],
+            )
+            notes = st.text_area(
+                "Notes",
+                placeholder="Optional context, such as strong essays or weak exams.",
+            )
+            submitted = st.form_submit_button("Save Course Grade")
+
+        if submitted:
+            try:
+                create_or_update_course_grade(
+                    {
+                        "course": course,
+                        "term": term,
+                        "grade": grade,
+                        "grade_percent": grade_percent,
+                        "grade_type": grade_type,
+                        "notes": notes,
+                    }
+                )
+            except ValueError as error:
+                st.error(str(error))
+            else:
+                st.success("Course grade saved.")
+                st.rerun()
+
+        grades = get_course_grades()
+        if not grades:
+            st.info("No course grades saved yet.")
+            return
+
+        st.markdown("#### Saved Course Grades")
+        for record in grades:
+            label_parts = [
+                display_value(record.get("course")),
+                display_value(record.get("term")),
+            ]
+            label = " | ".join(part for part in label_parts if part != "Not set")
+            with st.container(border=True):
+                st.markdown(f"**{label}**")
+                columns = st.columns(4)
+                columns[0].markdown(f"**Grade**  \n{display_value(record.get('grade'))}")
+                percent = record.get("grade_percent")
+                columns[1].markdown(
+                    f"**Percent**  \n{percent:g}%" if percent is not None else "**Percent**  \nNot set"
+                )
+                columns[2].markdown(
+                    f"**Type**  \n{display_value(record.get('grade_type'))}"
+                )
+                columns[3].markdown(
+                    f"**Updated**  \n{display_datetime(record.get('updated_at'))}"
+                )
+                if record.get("notes"):
+                    st.caption(record["notes"])
+                if st.button(
+                    "Delete Grade Record",
+                    key=f"delete-course-grade-{record['id']}",
+                ):
+                    delete_course_grade(record["id"])
+                    st.success("Course grade deleted.")
+                    st.rerun()
+
+
 def render_settings_workspace():
     st.subheader("Settings")
     st.caption("Course Task Inbox keeps the main workflow small and review-first.")
@@ -5647,6 +5783,8 @@ def render_settings_workspace():
         "The main app is now focused on adding course material, reviewing AI "
         "suggestions, keeping confirmed tasks, and approving deadline updates."
     )
+
+    render_course_grade_profile()
 
     with st.expander("Developer / Experimental", expanded=False):
         show_experimental = st.checkbox("Show hidden experimental pages")
