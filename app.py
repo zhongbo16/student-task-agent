@@ -3892,10 +3892,16 @@ def v0_tasks_for_view(view_name):
 
 def render_v0_task_cards(tasks, view_name):
     if not tasks:
-        if view_name == "All Tasks":
+        if not active_confirmed_tasks() or view_name == "All Tasks":
             st.info("No confirmed tasks yet. Review AI suggestions to build your task dashboard.")
         else:
-            st.info("No confirmed tasks in this view.")
+            st.info(
+                "No confirmed tasks in this view. Review Suggestions is where "
+                "new AI-detected tasks become official."
+            )
+        if st.button("Review Suggestions", key=f"empty-tasks-review-{view_name}"):
+            st.session_state.pending_nav = "Review Suggestions"
+            st.rerun()
         return
 
     for task in tasks:
@@ -3907,13 +3913,11 @@ def render_v0_task_cards(tasks, view_name):
             columns[2].markdown(f"**Due**  \n{display_task_datetime(task.get('due_at'))}")
             columns[3].markdown(f"**Weight**  \n{display_value(task.get('weight'))}")
             columns[4].markdown(f"**Status**  \n{display_value(task.get('status'))}")
-            if task.get("source_snippet"):
-                with st.expander("Details"):
+            with st.expander("Details"):
+                if task.get("source_snippet"):
+                    st.markdown("**Source snippet**")
                     st.write(task["source_snippet"])
                 render_task_fields(task)
-            else:
-                with st.expander("Details"):
-                    render_task_fields(task)
             if task.get("status") == "done":
                 if st.button("Reopen", key=f"v0-reopen-{task['id']}"):
                     update_task_status(task["id"], "confirmed")
@@ -3939,7 +3943,10 @@ def render_v0_tasks():
 def render_pending_task_updates():
     updates = get_pending_task_updates()
     if not updates:
-        st.info("No pending updates. Paste a new announcement to check for task changes.")
+        st.info(
+            "No pending updates. This page is for later announcements or "
+            "changed course material that might add tasks or change deadlines."
+        )
         return
 
     for update in updates:
@@ -5211,6 +5218,11 @@ def render_settings_workspace():
     columns[0].metric("OpenAI Key", "Yes" if key_present else "No")
     if not key_present:
         st.info(key_message)
+    st.caption(
+        "OpenAI is only required for Add Material extraction and Check Updates. "
+        "Reviewing suggestions, confirming, editing, ignoring, and viewing "
+        "tasks all work locally without an API key."
+    )
 
     st.markdown("### Product Scope")
     st.write(
