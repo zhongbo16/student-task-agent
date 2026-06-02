@@ -1658,25 +1658,6 @@ def create_canvas_assignment_task(assignment):
         return False
 
     if task_exists_by_external_id(external_source, external_id):
-        update_task_from_external_candidate({
-            "title": assignment.get("title") or "Untitled Canvas assignment",
-            "course": assignment.get("course_name"),
-            "task_type": "assignment",
-            "source": "quercus_assignment",
-            "confidence": "high",
-            "due_at": _canvas_due_date(assignment.get("due_at")),
-            "planned_date": None,
-            "estimated_minutes": None,
-            "priority": "medium",
-            "notes": None,
-            "source_url": assignment.get("external_url"),
-            "source_snippet": None,
-            "external_source": external_source,
-            "external_id": str(external_id),
-            "urgency_score": 0,
-            "urgency_label": None,
-            "recommended_status": "confirmed",
-        })
         return False
 
     external_url = assignment.get("external_url")

@@ -129,6 +129,7 @@ from db import (
     update_task_candidate_decision,
     update_task_update_status,
     update_task_status,
+    task_exists_by_external_id,
 )
 from file_parser import extract_text_from_pdf, get_file_metadata
 from planner import generate_today_plan, sort_tasks_for_dashboard, task_indicators
@@ -645,26 +646,6 @@ def inject_calm_command_css():
             margin-top: 0.6rem;
         }
 
-        .past-deadline-strip {
-            background: rgba(185, 28, 28, 0.06);
-            border: 1px solid rgba(185, 28, 28, 0.18);
-            border-radius: 8px;
-            padding: 0.8rem;
-            margin: 0.75rem 0 1rem;
-        }
-
-        .past-deadline-title {
-            color: var(--critical);
-            font-weight: 760;
-            margin-bottom: 0.45rem;
-        }
-
-        .past-deadline-item {
-            color: var(--text-secondary);
-            font-size: 0.85rem;
-            line-height: 1.45;
-            margin: 0.18rem 0;
-        }
         </style>
         """,
         unsafe_allow_html=True,
@@ -3846,6 +3827,95 @@ def render_manual_task_fallback():
                     st.rerun()
 
 
+def import_current_quercus_assignments():
+    assignments, summary = get_all_assignments()
+    stats = {
+        "courses_found": summary.get("courses_found", 0),
+        "assignments_found": summary.get("assignments_found", 0),
+        "imported": 0,
+        "duplicates_skipped": 0,
+        "past_due_skipped": 0,
+        "no_due_date_skipped": 0,
+        "errors": list(summary.get("errors", [])),
+    }
+    today = date.today()
+
+    for assignment in assignments:
+        due_date = parse_timeline_date(assignment.get("due_at"))
+        if not due_date:
+            stats["no_due_date_skipped"] += 1
+            continue
+        if due_date < today:
+            stats["past_due_skipped"] += 1
+            continue
+
+        external_source = assignment.get("external_source") or "canvas_assignment"
+        external_id = assignment.get("external_id")
+        if task_exists_by_external_id(external_source, external_id):
+            stats["duplicates_skipped"] += 1
+            continue
+
+        if create_canvas_assignment_task(assignment):
+            stats["imported"] += 1
+        else:
+            stats["duplicates_skipped"] += 1
+
+    return stats
+
+
+def render_quercus_assignment_import():
+    with st.expander("Import assignments from Quercus"):
+        st.caption(
+            "Optional read-only import. This reads official Quercus/Canvas "
+            "assignments and creates confirmed tasks for assignments due today "
+            "or later. Old deadlines and assignments without due dates are skipped."
+        )
+
+        base_url_configured = has_canvas_base_url()
+        token_present = has_canvas_api_token()
+        status_columns = st.columns(2)
+        status_columns[0].metric("Canvas URL", "Ready" if base_url_configured else "Missing")
+        status_columns[1].metric("Canvas Token", "Ready" if token_present else "Missing")
+
+        if not base_url_configured:
+            st.warning("Add CANVAS_BASE_URL to .env before importing from Quercus.")
+        if not token_present:
+            st.warning("Add CANVAS_API_TOKEN to .env before importing from Quercus.")
+
+        if st.button(
+            "Import Current Quercus Assignments",
+            disabled=not (base_url_configured and token_present),
+            key="v0-import-quercus-assignments",
+        ):
+            with st.spinner("Reading Quercus assignments..."):
+                stats = import_current_quercus_assignments()
+
+            summary_columns = st.columns(4)
+            summary_columns[0].metric("Courses", stats["courses_found"])
+            summary_columns[1].metric("Assignments found", stats["assignments_found"])
+            summary_columns[2].metric("Imported", stats["imported"])
+            summary_columns[3].metric("Duplicates skipped", stats["duplicates_skipped"])
+
+            st.caption(
+                f"Skipped {stats['past_due_skipped']} past-deadline assignment(s) "
+                f"and {stats['no_due_date_skipped']} assignment(s) without due dates."
+            )
+
+            for error in stats["errors"]:
+                st.error(error)
+
+            if stats["imported"]:
+                st.success(
+                    f"Imported {stats['imported']} confirmed task(s). "
+                    "Open Tasks to review them."
+                )
+                if st.button("Open Tasks", key="quercus-import-open-tasks"):
+                    st.session_state.pending_nav = "Tasks"
+                    st.rerun()
+            elif not stats["errors"]:
+                st.info("No new current Quercus assignments were imported.")
+
+
 def render_suggestion_edit_form(task):
     with st.expander("Edit"):
         with st.form(f"edit-suggestion-{task['id']}"):
@@ -4008,6 +4078,7 @@ def render_add_material():
                 st.rerun()
 
     render_manual_task_fallback()
+    render_quercus_assignment_import()
 
 
 def active_confirmed_tasks():
@@ -4015,6 +4086,14 @@ def active_confirmed_tasks():
         task for task in get_all_tasks()
         if task.get("status") in ("confirmed", "in_progress")
     ]
+
+
+def task_updated_datetime(task):
+    value = task.get("updated_at") or ""
+    try:
+        return datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return datetime.min
 
 
 def v0_tasks_for_view(view_name):
@@ -4047,7 +4126,11 @@ def v0_tasks_for_view(view_name):
             )
         ]
     elif view_name == "Done":
-        tasks = get_tasks_by_status("done")
+        return sorted(
+            get_tasks_by_status("done"),
+            key=task_updated_datetime,
+            reverse=True,
+        )
 
     return sort_tasks_for_dashboard(tasks, view_name)
 
@@ -4074,6 +4157,9 @@ def render_due_date_editor(task, view_name):
 
 def render_v0_task_cards(tasks, view_name):
     if not tasks:
+        if view_name == "Done":
+            st.info("No completed tasks yet.")
+            return
         if not active_confirmed_tasks() or view_name == "All Tasks":
             st.info("No confirmed tasks yet. Review AI suggestions to build your task dashboard.")
         else:
@@ -4134,7 +4220,6 @@ def v0_calendar_groups(days=14):
         and task.get("due_at")
     ]
 
-    past_deadlines = []
     upcoming = {
         today + timedelta(days=offset): []
         for offset in range(days)
@@ -4143,16 +4228,13 @@ def v0_calendar_groups(days=14):
         due_date = parse_timeline_date(task.get("due_at"))
         if not due_date:
             continue
-        if due_date < today:
-            past_deadlines.append(task)
-        elif today <= due_date <= end_date and task.get("status") in (
+        if today <= due_date <= end_date and task.get("status") in (
             "confirmed",
             "in_progress",
         ):
             upcoming[due_date].append(task)
 
     return {
-        "past_deadlines": sorted(past_deadlines, key=calendar_task_sort_key),
         "upcoming": [
             (day, sorted(day_tasks, key=calendar_task_sort_key))
             for day, day_tasks in upcoming.items()
@@ -4171,40 +4253,6 @@ def calendar_pill_html(task):
         f'{title}'
         f'<span class="calendar-pill-course">{course} | {status}</span>'
         '</div>'
-    )
-
-
-def render_past_deadlines_overview(tasks):
-    if not tasks:
-        st.info("No past deadlines.")
-        return
-
-    visible_tasks = tasks[:8]
-    items_html = "".join(
-        (
-            '<div class="past-deadline-item">'
-            f'{escape_html(display_task_datetime(task.get("due_at")))} | '
-            f'{escape_html(task.get("course"))} | '
-            f'{escape_html(task.get("title"))}'
-            '</div>'
-        )
-        for task in visible_tasks
-    )
-    if len(tasks) > len(visible_tasks):
-        items_html += (
-            '<div class="past-deadline-item">'
-            f'+ {len(tasks) - len(visible_tasks)} more past deadline(s)'
-            '</div>'
-        )
-
-    st.markdown(
-        (
-            '<div class="past-deadline-strip">'
-            '<div class="past-deadline-title">Past Deadlines</div>'
-            f'{items_html}'
-            '</div>'
-        ),
-        unsafe_allow_html=True,
     )
 
 
@@ -4260,7 +4308,6 @@ def render_v0_calendar():
     )
     groups = v0_calendar_groups(days=14)
 
-    render_past_deadlines_overview(groups["past_deadlines"])
     render_calendar_grid(groups["upcoming"])
 
     action_tasks = []
@@ -4288,6 +4335,25 @@ def render_v0_tasks():
     )
     if view_name == "Calendar":
         render_v0_calendar()
+    elif view_name == "Done":
+        done_tasks = v0_tasks_for_view(view_name)
+        if len(done_tasks) > 10:
+            limit_choice = st.radio(
+                "Completed tasks shown",
+                options=["10", "25", "All"],
+                horizontal=True,
+            )
+            if limit_choice == "All":
+                shown_tasks = done_tasks
+            else:
+                shown_tasks = done_tasks[:int(limit_choice)]
+            st.caption(
+                f"Showing {len(shown_tasks)} of {len(done_tasks)} completed tasks, "
+                "most recently completed first."
+            )
+        else:
+            shown_tasks = done_tasks
+        render_v0_task_cards(shown_tasks, view_name)
     else:
         render_v0_task_cards(v0_tasks_for_view(view_name), view_name)
 
