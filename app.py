@@ -632,6 +632,31 @@ def display_task_datetime(value):
     return label
 
 
+def display_task_time(value):
+    if not value:
+        return "No time"
+
+    if isinstance(value, datetime):
+        parsed = value
+        include_time = bool(parsed.hour or parsed.minute or parsed.second)
+    else:
+        text = str(value).strip()
+        include_time = len(text) > 10 and (":" in text[10:] or "T" in text[10:])
+        if not include_time:
+            return "No time"
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            try:
+                parsed = datetime.strptime(text[:16], "%Y-%m-%d %H:%M")
+            except ValueError:
+                return "No time"
+
+    if parsed.tzinfo is not None:
+        parsed = parsed.astimezone(LOCAL_TIMEZONE)
+    return parsed.strftime("%I:%M %p").lstrip("0")
+
+
 def render_detail_field(container, label, value, formatter=None):
     shown_value = formatter(value) if formatter else display_value(value)
     container.markdown(
@@ -4004,16 +4029,107 @@ def render_v0_task_cards(tasks, view_name):
                     st.rerun()
 
 
+def calendar_task_sort_key(task):
+    return (
+        task.get("due_at") or "9999-12-31",
+        task.get("course") or "",
+        task.get("title") or "",
+    )
+
+
+def v0_calendar_groups(days=14):
+    today = date.today()
+    end_date = today + timedelta(days=days)
+    tasks = [
+        task for task in get_all_tasks()
+        if task.get("status") in ("confirmed", "in_progress", "done")
+        and task.get("due_at")
+    ]
+
+    past_deadlines = []
+    upcoming = {
+        today + timedelta(days=offset): []
+        for offset in range(days + 1)
+    }
+    for task in tasks:
+        due_date = parse_timeline_date(task.get("due_at"))
+        if not due_date:
+            continue
+        if due_date < today:
+            past_deadlines.append(task)
+        elif today <= due_date <= end_date and task.get("status") in (
+            "confirmed",
+            "in_progress",
+        ):
+            upcoming[due_date].append(task)
+
+    return {
+        "past_deadlines": sorted(past_deadlines, key=calendar_task_sort_key),
+        "upcoming": [
+            (day, sorted(day_tasks, key=calendar_task_sort_key))
+            for day, day_tasks in upcoming.items()
+        ],
+    }
+
+
+def render_calendar_task_item(task, key_prefix):
+    with st.container(border=True):
+        st.markdown(f"### {display_value(task.get('title'))}")
+        columns = st.columns(4)
+        columns[0].markdown(f"**Course**  \n{display_value(task.get('course'))}")
+        columns[1].markdown(f"**Due time**  \n{display_task_time(task.get('due_at'))}")
+        columns[2].markdown(f"**Due**  \n{display_task_datetime(task.get('due_at'))}")
+        columns[3].markdown(f"**Status**  \n{display_value(task.get('status'))}")
+
+        render_due_date_editor(task, key_prefix)
+        if task.get("status") == "done":
+            st.caption("Already done.")
+        elif st.button("Mark Done", key=f"{view_key(key_prefix)}-done-{task['id']}"):
+            update_task_status(task["id"], "done")
+            st.rerun()
+
+
+def render_v0_calendar():
+    st.markdown("### Calendar")
+    st.caption(
+        "Confirmed and in-progress tasks grouped by due date for the next 14 days."
+    )
+    groups = v0_calendar_groups(days=14)
+
+    st.markdown("### Past Deadlines")
+    if groups["past_deadlines"]:
+        for task in groups["past_deadlines"]:
+            render_calendar_task_item(task, "Calendar Past Deadlines")
+    else:
+        st.info("No past deadlines.")
+
+    st.markdown("### Next 14 Days")
+    has_upcoming = False
+    for day, day_tasks in groups["upcoming"]:
+        if not day_tasks:
+            continue
+        has_upcoming = True
+        st.markdown(f"#### {timeline_day_label(day)}")
+        for task in day_tasks:
+            render_calendar_task_item(task, f"Calendar {day.isoformat()}")
+
+    if not has_upcoming:
+        st.info("No confirmed or in-progress tasks due in the next 14 days.")
+
+
 def render_v0_tasks():
     st.subheader("Tasks")
     st.caption("These are confirmed tasks you approved.")
     view_name = st.radio(
         "View",
-        options=["Today", "This Week", "All Tasks", "Done"],
+        options=["Today", "This Week", "All Tasks", "Calendar", "Done"],
         horizontal=True,
         label_visibility="collapsed",
     )
-    render_v0_task_cards(v0_tasks_for_view(view_name), view_name)
+    if view_name == "Calendar":
+        render_v0_calendar()
+    else:
+        render_v0_task_cards(v0_tasks_for_view(view_name), view_name)
 
 
 def render_pending_task_updates():
