@@ -3955,12 +3955,18 @@ def render_v0_task_cards(tasks, view_name):
     for task in tasks:
         with st.container(border=True):
             st.markdown(f"### {display_value(task.get('title'))}")
-            columns = st.columns(5)
-            columns[0].markdown(f"**Course**  \n{display_value(task.get('course'))}")
-            columns[1].markdown(f"**Type**  \n{display_value(task.get('task_type'))}")
-            columns[2].markdown(f"**Due**  \n{display_task_datetime(task.get('due_at'))}")
-            columns[3].markdown(f"**Weight**  \n{display_value(task.get('weight'))}")
-            columns[4].markdown(f"**Status**  \n{display_value(task.get('status'))}")
+            visible_fields = [
+                ("Course", task.get("course")),
+                ("Type", task.get("task_type")),
+                ("Due", display_task_datetime(task.get("due_at"))),
+                ("Status", task.get("status")),
+            ]
+            if task.get("weight"):
+                visible_fields.insert(3, ("Weight", task.get("weight")))
+
+            columns = st.columns(len(visible_fields))
+            for index, (label, value) in enumerate(visible_fields):
+                columns[index].markdown(f"**{label}**  \n{display_value(value)}")
             with st.expander("Details"):
                 if task.get("source_snippet"):
                     st.markdown("**Source snippet**")
