@@ -362,6 +362,29 @@ def _create_course_grades_table(cursor):
     ''')
 
 
+def _create_courses_table(cursor):
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS courses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            course_key TEXT NOT NULL UNIQUE,
+            course_name TEXT NOT NULL,
+            course_code TEXT,
+            term TEXT,
+            current_grade_percent REAL CHECK (
+                current_grade_percent IS NULL
+                OR (current_grade_percent >= 0 AND current_grade_percent <= 100)
+            ),
+            target_grade_percent REAL CHECK (
+                target_grade_percent IS NULL
+                OR (target_grade_percent >= 0 AND target_grade_percent <= 100)
+            ),
+            notes TEXT,
+            created_at TEXT,
+            updated_at TEXT
+        )
+    ''')
+
+
 def _create_course_grade_items_table(cursor):
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS course_grade_items (
@@ -921,6 +944,7 @@ def init_db():
         _create_study_sessions_table(cursor)
         _create_task_candidates_table(cursor)
         _create_course_archives_table(cursor)
+        _create_courses_table(cursor)
         _create_course_grades_table(cursor)
         _create_course_grade_items_table(cursor)
         _create_morning_checkins_table(cursor)
@@ -3527,6 +3551,104 @@ def _clean_course_name(value):
 
 def _course_key(value):
     return _clean_course_name(value).casefold()
+
+
+def _course_profile_key(course_name, course_code=None, term=None):
+    name = _clean_course_name(course_code or course_name)
+    term_text = _clean_candidate_text(term) or ""
+    return f"{name.casefold()}::{term_text.casefold()}"
+
+
+def _clean_percent(value, field_name):
+    if value in (None, ""):
+        return None
+    try:
+        percent = float(value)
+    except (TypeError, ValueError) as error:
+        raise ValueError(f"{field_name} must be a number between 0 and 100.") from error
+    if percent < 0 or percent > 100:
+        raise ValueError(f"{field_name} must be between 0 and 100.")
+    return percent
+
+
+def create_or_update_course_profile(record):
+    course_name = _clean_candidate_text(record.get("course_name"))
+    if not course_name:
+        raise ValueError("Course name is required.")
+
+    course_code = _clean_candidate_text(record.get("course_code"))
+    term = _clean_candidate_text(record.get("term"))
+    current_grade_percent = _clean_percent(
+        record.get("current_grade_percent"),
+        "Current grade percentage",
+    )
+    target_grade_percent = _clean_percent(
+        record.get("target_grade_percent"),
+        "Target grade percentage",
+    )
+    if target_grade_percent is None:
+        raise ValueError("Target grade percentage is required.")
+
+    notes = _clean_candidate_text(record.get("notes"))
+    course_key = _course_profile_key(course_name, course_code, term)
+    now = datetime.now().isoformat(timespec="seconds")
+
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            INSERT INTO courses (
+                course_key, course_name, course_code, term,
+                current_grade_percent, target_grade_percent, notes,
+                created_at, updated_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(course_key) DO UPDATE SET
+                course_name = excluded.course_name,
+                course_code = excluded.course_code,
+                term = excluded.term,
+                current_grade_percent = excluded.current_grade_percent,
+                target_grade_percent = excluded.target_grade_percent,
+                notes = excluded.notes,
+                updated_at = excluded.updated_at
+            ''',
+            (
+                course_key,
+                course_name,
+                course_code,
+                term,
+                current_grade_percent,
+                target_grade_percent,
+                notes,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+        return cursor.lastrowid
+
+
+def get_course_profiles():
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, course_key, course_name, course_code, term,
+                   current_grade_percent, target_grade_percent, notes,
+                   created_at, updated_at
+            FROM courses
+            ORDER BY course_name ASC, term DESC, id ASC
+            '''
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def delete_course_profile(course_id):
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute("DELETE FROM courses WHERE id = ?", (course_id,))
+        conn.commit()
+        return cursor.rowcount > 0
 
 
 def _clean_grade_percent(value):

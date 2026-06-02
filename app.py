@@ -74,6 +74,7 @@ from db import (
     create_or_update_morning_checkin,
     create_or_update_behavior_plan,
     create_or_update_course_grade,
+    create_or_update_course_profile,
     create_or_update_daily_refresh_run,
     create_or_update_daily_review,
     create_personal_commitment,
@@ -83,6 +84,7 @@ from db import (
     create_canvas_assignment_task,
     create_study_session_start,
     deactivate_agent_memory,
+    delete_course_profile,
     delete_course_grade,
     export_daily_reviews_to_csv,
     get_active_study_session,
@@ -99,6 +101,7 @@ from db import (
     get_course_summaries,
     get_course_grades,
     get_course_grade_items,
+    get_course_profiles,
     get_morning_checkin_by_date,
     get_pending_agent_memory_candidates,
     get_pending_task_updates,
@@ -148,6 +151,7 @@ EXPORT_DIR = BASE_DIR / "data" / "exports"
 LOCAL_TIMEZONE = ZoneInfo("America/Toronto")
 
 MAIN_MENU_OPTIONS = [
+    "Dashboard",
     "Add Material",
     "Review Suggestions",
     "Tasks",
@@ -3681,6 +3685,345 @@ def date_key(value):
     return parsed.isoformat() if parsed else None
 
 
+def parse_weight_percent(value):
+    if value in (None, ""):
+        return None
+    match = re.search(r"(\d+(?:\.\d+)?)", str(value))
+    if not match:
+        return None
+    percent = float(match.group(1))
+    if percent <= 0 or percent > 100:
+        return None
+    return percent
+
+
+def percent_label(value):
+    if value is None:
+        return "-"
+    return f"{float(value):.1f}%".replace(".0%", "%")
+
+
+def course_identity_values(course_profile):
+    values = [
+        course_profile.get("course_name"),
+        course_profile.get("course_code"),
+    ]
+    return [normalize_match_text(value) for value in values if normalize_match_text(value)]
+
+
+def task_matches_course_profile(task, course_profile):
+    task_course = normalize_match_text(task.get("course"))
+    if not task_course:
+        return False
+    identities = course_identity_values(course_profile)
+    return any(
+        task_course == identity
+        or identity in task_course
+        or task_course in identity
+        for identity in identities
+    )
+
+
+def row_matches_course_profile(row, course_profile, key="course"):
+    row_course = normalize_match_text(row.get(key))
+    if not row_course:
+        return False
+    return any(
+        row_course == identity
+        or identity in row_course
+        or row_course in identity
+        for identity in course_identity_values(course_profile)
+    )
+
+
+def course_display_name(course_profile):
+    code = course_profile.get("course_code")
+    name = course_profile.get("course_name")
+    if code and name and normalize_match_text(code) not in normalize_match_text(name):
+        return f"{code} - {name}"
+    return name or code or "Untitled course"
+
+
+def latest_grade_for_course(course_profile, course_grades):
+    profile_grade = course_profile.get("current_grade_percent")
+    if profile_grade is not None:
+        return profile_grade
+    for grade in course_grades:
+        if row_matches_course_profile(grade, course_profile):
+            if grade.get("grade_percent") is not None:
+                return grade["grade_percent"]
+    return None
+
+
+def official_course_tasks(course_profile, tasks=None):
+    tasks = tasks if tasks is not None else get_all_tasks()
+    return [
+        task for task in tasks
+        if task.get("status") in ("confirmed", "in_progress", "done")
+        and task_matches_course_profile(task, course_profile)
+    ]
+
+
+def active_course_tasks(course_profile, tasks=None):
+    return [
+        task for task in official_course_tasks(course_profile, tasks)
+        if task.get("status") in ("confirmed", "in_progress")
+    ]
+
+
+def course_progress_percent(course_profile, tasks=None):
+    course_tasks = official_course_tasks(course_profile, tasks)
+    weighted_tasks = [
+        (task, parse_weight_percent(task.get("weight")))
+        for task in course_tasks
+    ]
+    weighted_tasks = [(task, weight) for task, weight in weighted_tasks if weight]
+    if weighted_tasks:
+        completed_weight = sum(
+            weight for task, weight in weighted_tasks
+            if task.get("status") == "done"
+        )
+        return min(100.0, completed_weight), "weighted"
+
+    if not course_tasks:
+        return 0.0, "empty"
+    done_count = sum(1 for task in course_tasks if task.get("status") == "done")
+    return (done_count / len(course_tasks)) * 100, "task_count"
+
+
+def due_reason_for_task(task, today=None):
+    today = today or date.today()
+    due_date = parse_timeline_date(task.get("due_at"))
+    if not due_date:
+        return None
+    if due_date < today:
+        return "overdue"
+    if due_date == today:
+        return "due today"
+    if due_date == today + timedelta(days=1):
+        return "due tomorrow"
+    if due_date <= today + timedelta(days=7):
+        return "due this week"
+    return f"due {display_task_datetime(task.get('due_at'))}"
+
+
+def priority_score_for_course_task(task, course_gap=None, today=None):
+    today = today or date.today()
+    score = 0
+    reasons = []
+    due_date = parse_timeline_date(task.get("due_at"))
+    if due_date:
+        days_until_due = (due_date - today).days
+        if days_until_due < 0:
+            score += 100
+            reasons.append("overdue")
+        elif days_until_due == 0:
+            score += 85
+            reasons.append("due today")
+        elif days_until_due == 1:
+            score += 70
+            reasons.append("due tomorrow")
+        elif days_until_due <= 7:
+            score += 45
+            reasons.append("due this week")
+        else:
+            score += max(5, 25 - days_until_due)
+    weight = parse_weight_percent(task.get("weight"))
+    if weight:
+        score += weight * 5
+        reasons.append(f"worth {percent_label(weight)}")
+    if course_gap and course_gap > 0:
+        score += min(30, course_gap * 2)
+        reasons.append("course is below target")
+    if task.get("status") == "in_progress":
+        score += 10
+        reasons.append("already in progress")
+    return score, reasons
+
+
+def highest_priority_course_task(course_profile, current_grade, tasks=None):
+    target = course_profile.get("target_grade_percent")
+    course_gap = (
+        target - current_grade
+        if target is not None and current_grade is not None
+        else None
+    )
+    candidates = active_course_tasks(course_profile, tasks)
+    if not candidates:
+        return None, "No active upcoming task."
+
+    scored = []
+    for task in candidates:
+        score, reasons = priority_score_for_course_task(task, course_gap)
+        scored.append((score, task, reasons))
+    scored.sort(key=lambda item: (-item[0], item[1].get("due_at") or "9999-12-31"))
+    _, task, reasons = scored[0]
+    return task, ", ".join(reasons[:3]) or "best next academic task"
+
+
+def course_feedback_items(course_profile, grade_items=None):
+    grade_items = grade_items if grade_items is not None else get_course_grade_items()
+    return [
+        item for item in grade_items
+        if row_matches_course_profile(item, course_profile, key="course_name")
+    ]
+
+
+def course_completeness(course_profile, tasks=None, course_grades=None, grade_items=None):
+    tasks = official_course_tasks(course_profile, tasks)
+    course_grades = course_grades if course_grades is not None else get_course_grades()
+    grade_items = course_feedback_items(course_profile, grade_items)
+    checks = [
+        (
+            "Target grade",
+            course_profile.get("target_grade_percent") is not None,
+            "Add target grade",
+        ),
+        (
+            "Current grade",
+            latest_grade_for_course(course_profile, course_grades) is not None,
+            "Add current grade",
+        ),
+        (
+            "Tasks",
+            bool(tasks),
+            "Add at least one task or assignment",
+        ),
+        (
+            "Weights",
+            any(parse_weight_percent(task.get("weight")) for task in tasks),
+            "Add assignment weight",
+        ),
+        (
+            "Recent feedback",
+            bool(grade_items),
+            "Add recent assignment grade or feedback",
+        ),
+    ]
+    completed = sum(1 for _, done, _ in checks if done)
+    missing = [missing for _, done, missing in checks if not done]
+    return int((completed / len(checks)) * 100), missing
+
+
+def course_risk_level(course_profile, current_grade, overdue_count, missing_count):
+    target = course_profile.get("target_grade_percent")
+    if current_grade is None:
+        return "Medium"
+    gap = target - current_grade if target is not None else 0
+    if gap >= 10 or overdue_count >= 2 or (missing_count and gap > 0):
+        return "High"
+    if gap > 0 or overdue_count == 1 or missing_count:
+        return "Medium"
+    return "Low"
+
+
+def course_dashboard_model(course_profile, tasks=None, course_grades=None, grade_items=None):
+    tasks = tasks if tasks is not None else get_all_tasks()
+    course_grades = course_grades if course_grades is not None else get_course_grades()
+    grade_items = grade_items if grade_items is not None else get_course_grade_items()
+    today = date.today()
+    official_tasks = official_course_tasks(course_profile, tasks)
+    active_tasks = [
+        task for task in official_tasks
+        if task.get("status") in ("confirmed", "in_progress")
+    ]
+    upcoming_tasks = [
+        task for task in active_tasks
+        if parse_timeline_date(task.get("due_at"))
+        and parse_timeline_date(task.get("due_at")) >= today
+    ]
+    overdue_tasks = [
+        task for task in active_tasks
+        if parse_timeline_date(task.get("due_at"))
+        and parse_timeline_date(task.get("due_at")) < today
+    ]
+    feedback_items = course_feedback_items(course_profile, grade_items)
+    missing_count = sum(1 for item in feedback_items if item.get("missing"))
+    current_grade = latest_grade_for_course(course_profile, course_grades)
+    progress, progress_source = course_progress_percent(course_profile, tasks)
+    priority_task, priority_reason = highest_priority_course_task(
+        course_profile,
+        current_grade,
+        tasks,
+    )
+    completeness, missing_data = course_completeness(
+        course_profile,
+        tasks,
+        course_grades,
+        grade_items,
+    )
+    return {
+        "course": course_profile,
+        "current_grade": current_grade,
+        "target_grade": course_profile.get("target_grade_percent"),
+        "gap": (
+            course_profile["target_grade_percent"] - current_grade
+            if course_profile.get("target_grade_percent") is not None
+            and current_grade is not None
+            else None
+        ),
+        "upcoming_count": len(upcoming_tasks),
+        "overdue_missing_count": len(overdue_tasks) + missing_count,
+        "progress": progress,
+        "progress_source": progress_source,
+        "risk": course_risk_level(
+            course_profile,
+            current_grade,
+            len(overdue_tasks),
+            missing_count,
+        ),
+        "priority_task": priority_task,
+        "priority_reason": priority_reason,
+        "completeness": completeness,
+        "missing_data": missing_data,
+    }
+
+
+def course_profile_for_task(task):
+    for course in get_course_profiles():
+        if task_matches_course_profile(task, course):
+            return course
+    return None
+
+
+def mark_task_done_with_impact(task):
+    course_profile = course_profile_for_task(task)
+    weight = parse_weight_percent(task.get("weight"))
+    before_progress = None
+    after_progress = None
+    progress_source = None
+    if course_profile:
+        before_progress, progress_source = course_progress_percent(course_profile)
+
+    update_task_status(task["id"], "done")
+
+    if course_profile:
+        after_progress, _ = course_progress_percent(course_profile, get_all_tasks())
+
+    pieces = [f"You completed {display_value(task.get('title'))}."]
+    if weight and course_profile:
+        pieces.append(
+            f"This task is worth {percent_label(weight)} of {course_display_name(course_profile)}."
+        )
+    elif weight:
+        pieces.append(f"This task is worth {percent_label(weight)} of the course.")
+
+    if before_progress is not None and after_progress is not None:
+        if after_progress > before_progress:
+            pieces.append(
+                "Course progress increased from "
+                f"{percent_label(before_progress)} to {percent_label(after_progress)}."
+            )
+        elif progress_source == "weighted" and weight:
+            pieces.append("Course progress is based on completed weighted work.")
+
+    due_reason = due_reason_for_task(task)
+    if due_reason in ("overdue", "due today", "due tomorrow", "due this week"):
+        pieces.append(f"This reduces course risk because the task was {due_reason}.")
+
+    st.session_state.status_update_message = " ".join(pieces)
+
+
 def task_similarity(left, right):
     left_text = normalize_match_text(left)
     right_text = normalize_match_text(right)
@@ -3807,6 +4150,7 @@ def render_manual_task_fallback():
             title = st.text_input("Task title")
             course = st.text_input("Course")
             task_type = st.text_input("Task type")
+            weight = st.text_input("Weight, optional", placeholder="Example: 5%")
             due_at = st.date_input("Due date")
             submitted = st.form_submit_button("Create Confirmed Task")
 
@@ -3820,6 +4164,7 @@ def render_manual_task_fallback():
                     "title": title,
                     "course": course,
                     "task_type": task_type,
+                    "weight": weight,
                     "due_at": due_at,
                     "status": "confirmed",
                     "source": "manual",
@@ -3966,6 +4311,186 @@ def render_quercus_assignment_import():
                     st.rerun()
             elif not stats["errors"]:
                 st.info("No new current Quercus assignments were imported.")
+
+
+def render_course_profile_form(form_key, course_profile=None, submit_label="Save Course"):
+    course_profile = course_profile or {}
+    with st.form(form_key):
+        course_name = st.text_input(
+            "Course name",
+            value=course_profile.get("course_name") or "",
+            placeholder="Example: Introduction to Statistics",
+        )
+        columns = st.columns(2)
+        course_code = columns[0].text_input(
+            "Course code, optional",
+            value=course_profile.get("course_code") or "",
+            placeholder="Example: STA257",
+        )
+        term = columns[1].text_input(
+            "Term, optional",
+            value=course_profile.get("term") or "",
+            placeholder="Example: Winter 2026",
+        )
+        grade_columns = st.columns(2)
+        current_grade = grade_columns[0].text_input(
+            "Current grade percentage, optional",
+            value=(
+                ""
+                if course_profile.get("current_grade_percent") is None
+                else f"{course_profile.get('current_grade_percent'):g}"
+            ),
+            placeholder="Example: 76",
+        )
+        target_grade = grade_columns[1].text_input(
+            "Target grade percentage",
+            value=(
+                ""
+                if course_profile.get("target_grade_percent") is None
+                else f"{course_profile.get('target_grade_percent'):g}"
+            ),
+            placeholder="Example: 85",
+        )
+        submitted = st.form_submit_button(submit_label)
+
+    if not submitted:
+        return False
+
+    try:
+        create_or_update_course_profile(
+            {
+                "course_name": course_name,
+                "course_code": course_code,
+                "term": term,
+                "current_grade_percent": current_grade,
+                "target_grade_percent": target_grade,
+            }
+        )
+    except ValueError as error:
+        st.error(str(error))
+        return False
+
+    st.success("Course saved.")
+    return True
+
+
+def render_welcome_setup():
+    st.subheader("Academic Recovery Dashboard")
+    st.caption(
+        "This app helps you track course status, prioritize high-impact work, "
+        "and see progress toward your grade goals."
+    )
+    st.info(
+        "Start with one course. You can add course materials, assignments, "
+        "grades, and feedback later."
+    )
+    if render_course_profile_form(
+        "first-course-profile-form",
+        submit_label="Create First Course",
+    ):
+        st.rerun()
+
+
+def render_course_dashboard_metrics(model):
+    columns = st.columns(4)
+    columns[0].metric("Current", percent_label(model["current_grade"]))
+    columns[1].metric("Target", percent_label(model["target_grade"]))
+    columns[2].metric("Gap", percent_label(model["gap"]))
+    columns[3].metric("Risk", model["risk"])
+
+    columns = st.columns(4)
+    columns[0].metric("Upcoming tasks", model["upcoming_count"])
+    columns[1].metric("Missing / overdue", model["overdue_missing_count"])
+    columns[2].metric("Progress", percent_label(model["progress"]))
+    columns[3].metric("Dashboard", f"{model['completeness']}% complete")
+
+
+def render_course_dashboard_card(model):
+    course = model["course"]
+    with st.container(border=True):
+        st.markdown(f"### {display_value(course_display_name(course))}")
+        render_course_dashboard_metrics(model)
+
+        if model["priority_task"]:
+            task = model["priority_task"]
+            st.markdown("**Highest priority upcoming task**")
+            st.write(display_value(task.get("title")))
+            st.caption(
+                f"{display_task_datetime(task.get('due_at'))} | "
+                f"{display_value(task.get('weight'))} | "
+                f"Reason: {model['priority_reason']}"
+            )
+        else:
+            st.info("No active upcoming task for this course yet.")
+
+        if model["missing_data"]:
+            with st.expander("Dashboard completeness"):
+                st.write(f"Dashboard {model['completeness']}% complete")
+                for item in model["missing_data"]:
+                    st.caption(f"- {item}")
+
+        with st.expander("Edit course"):
+            if render_course_profile_form(
+                f"edit-course-profile-{course['id']}",
+                course,
+                submit_label="Save Course Changes",
+            ):
+                st.rerun()
+            if st.button(
+                "Delete Course Profile",
+                key=f"delete-course-profile-{course['id']}",
+            ):
+                delete_course_profile(course["id"])
+                st.success("Course profile deleted. Tasks and grades were not deleted.")
+                st.rerun()
+
+
+def render_academic_dashboard():
+    courses = get_course_profiles()
+    if not courses:
+        render_welcome_setup()
+        return
+
+    st.subheader("Academic Recovery Dashboard")
+    st.caption(
+        "See each course status, risk level, and the next task with the "
+        "highest academic impact."
+    )
+
+    top_columns = st.columns(3)
+    top_columns[0].metric("Courses", len(courses))
+    active_tasks = [
+        task for task in get_all_tasks()
+        if task.get("status") in ("confirmed", "in_progress")
+    ]
+    top_columns[1].metric("Active tasks", len(active_tasks))
+    high_risk_count = 0
+
+    tasks = get_all_tasks()
+    grades = get_course_grades()
+    feedback_items = get_course_grade_items(limit=300)
+    models = [
+        course_dashboard_model(course, tasks, grades, feedback_items)
+        for course in courses
+    ]
+    high_risk_count = sum(1 for model in models if model["risk"] == "High")
+    top_columns[2].metric("High-risk courses", high_risk_count)
+
+    with st.expander("Add another course"):
+        if render_course_profile_form("add-another-course-profile-form"):
+            st.rerun()
+
+    for model in models:
+        render_course_dashboard_card(model)
+
+    st.markdown("### Add Data")
+    data_columns = st.columns(2)
+    if data_columns[0].button("Add Material"):
+        st.session_state.pending_nav = "Add Material"
+        st.rerun()
+    if data_columns[1].button("Review Suggestions"):
+        st.session_state.pending_nav = "Review Suggestions"
+        st.rerun()
 
 
 def render_suggestion_edit_form(task):
@@ -4251,7 +4776,7 @@ def render_v0_task_cards(tasks, view_name):
                     st.rerun()
             else:
                 if st.button("Mark Done", key=f"v0-done-{task['id']}", type="primary"):
-                    update_task_status(task["id"], "done")
+                    mark_task_done_with_impact(task)
                     st.rerun()
 
 
@@ -4349,7 +4874,7 @@ def render_calendar_task_item(task, key_prefix):
         if task.get("status") == "done":
             st.caption("Already done.")
         elif st.button("Mark Done", key=f"{view_key(key_prefix)}-done-{task['id']}"):
-            update_task_status(task["id"], "done")
+            mark_task_done_with_impact(task)
             st.rerun()
 
 
@@ -5996,7 +6521,9 @@ def main():
         label_visibility="collapsed",
     )
 
-    if choice == "Add Material":
+    if choice == "Dashboard":
+        render_academic_dashboard()
+    elif choice == "Add Material":
         render_add_material()
     elif choice == "Review Suggestions":
         render_review_suggestions()
