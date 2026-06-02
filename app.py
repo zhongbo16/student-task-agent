@@ -35,6 +35,7 @@ from behavior_design import (
     has_openai_api_key as has_behavior_design_api_key,
 )
 from canvas_client import (
+    get_all_grade_feedback,
     get_all_assignments,
     get_canvas_base_url,
     has_canvas_api_token,
@@ -97,6 +98,7 @@ from db import (
     get_behavior_plan_by_date,
     get_course_summaries,
     get_course_grades,
+    get_course_grade_items,
     get_morning_checkin_by_date,
     get_pending_agent_memory_candidates,
     get_pending_task_updates,
@@ -133,6 +135,7 @@ from db import (
     update_task_update_status,
     update_task_status,
     task_exists_by_external_id,
+    upsert_course_grade_item,
 )
 from file_parser import extract_text_from_pdf, get_file_metadata
 from planner import generate_today_plan, sort_tasks_for_dashboard, task_indicators
@@ -5679,8 +5682,38 @@ def render_course_grade_profile():
     with st.expander("Course Grade Profile", expanded=False):
         st.caption(
             "Optional local record of previous or current course grades. "
-            "This is stored in SQLite only and is not imported from Quercus."
+            "You can enter grades manually or import your own read-only "
+            "Quercus/Canvas grades and instructor feedback."
         )
+
+        base_url_configured = has_canvas_base_url()
+        token_present = has_canvas_api_token()
+        import_columns = st.columns(3)
+        import_columns[0].metric("Canvas URL", "Ready" if base_url_configured else "Missing")
+        import_columns[1].metric("Canvas Token", "Ready" if token_present else "Missing")
+        import_columns[2].metric("Mode", "Read-only")
+        if st.button(
+            "Import Quercus Grades and Feedback",
+            disabled=not (base_url_configured and token_present),
+            key="import-quercus-grades-feedback",
+        ):
+            with st.spinner("Reading Quercus grades and instructor feedback..."):
+                course_grade_count, created_count, updated_count, summary = (
+                    import_quercus_grades_and_feedback()
+                )
+
+            result_columns = st.columns(4)
+            result_columns[0].metric("Courses", summary["courses_found"])
+            result_columns[1].metric("Course grades", course_grade_count)
+            result_columns[2].metric("Feedback created", created_count)
+            result_columns[3].metric("Feedback updated", updated_count)
+            if summary["errors"]:
+                for error in summary["errors"]:
+                    st.error(error)
+            else:
+                st.success("Quercus grades and feedback import finished.")
+
+        st.divider()
 
         with st.form("course-grade-profile-form"):
             course = st.text_input("Course", placeholder="Example: STA457")
@@ -5728,38 +5761,117 @@ def render_course_grade_profile():
         grades = get_course_grades()
         if not grades:
             st.info("No course grades saved yet.")
-            return
+        else:
+            st.markdown("#### Saved Course Grades")
+            for record in grades:
+                label_parts = [
+                    display_value(record.get("course")),
+                    display_value(record.get("term")),
+                ]
+                label = " | ".join(part for part in label_parts if part != "Not set")
+                with st.container(border=True):
+                    st.markdown(f"**{label}**")
+                    columns = st.columns(4)
+                    columns[0].markdown(f"**Grade**  \n{display_value(record.get('grade'))}")
+                    percent = record.get("grade_percent")
+                    columns[1].markdown(
+                        f"**Percent**  \n{percent:g}%" if percent is not None else "**Percent**  \nNot set"
+                    )
+                    columns[2].markdown(
+                        f"**Type**  \n{display_value(record.get('grade_type'))}"
+                    )
+                    columns[3].markdown(
+                        f"**Updated**  \n{display_datetime(record.get('updated_at'))}"
+                    )
+                    if record.get("notes"):
+                        st.caption(record["notes"])
+                    if st.button(
+                        "Delete Grade Record",
+                        key=f"delete-course-grade-{record['id']}",
+                    ):
+                        delete_course_grade(record["id"])
+                        st.success("Course grade deleted.")
+                        st.rerun()
 
-        st.markdown("#### Saved Course Grades")
-        for record in grades:
-            label_parts = [
-                display_value(record.get("course")),
-                display_value(record.get("term")),
-            ]
-            label = " | ".join(part for part in label_parts if part != "Not set")
-            with st.container(border=True):
-                st.markdown(f"**{label}**")
-                columns = st.columns(4)
-                columns[0].markdown(f"**Grade**  \n{display_value(record.get('grade'))}")
-                percent = record.get("grade_percent")
-                columns[1].markdown(
-                    f"**Percent**  \n{percent:g}%" if percent is not None else "**Percent**  \nNot set"
-                )
-                columns[2].markdown(
-                    f"**Type**  \n{display_value(record.get('grade_type'))}"
-                )
-                columns[3].markdown(
-                    f"**Updated**  \n{display_datetime(record.get('updated_at'))}"
-                )
-                if record.get("notes"):
-                    st.caption(record["notes"])
-                if st.button(
-                    "Delete Grade Record",
-                    key=f"delete-course-grade-{record['id']}",
-                ):
-                    delete_course_grade(record["id"])
-                    st.success("Course grade deleted.")
-                    st.rerun()
+        render_recent_course_feedback()
+
+
+def import_quercus_grades_and_feedback():
+    course_grades, grade_items, summary = get_all_grade_feedback()
+    course_grade_count = 0
+    created_count = 0
+    updated_count = 0
+
+    for grade in course_grades:
+        create_or_update_course_grade(
+            {
+                "course": grade.get("course"),
+                "term": grade.get("term"),
+                "grade": grade.get("grade"),
+                "grade_percent": grade.get("grade_percent"),
+                "grade_type": grade.get("grade_type") or "current",
+                "notes": "Imported from Quercus/Canvas total scores.",
+            }
+        )
+        course_grade_count += 1
+
+    for item in grade_items:
+        result = upsert_course_grade_item(item)
+        if result == "created":
+            created_count += 1
+        elif result == "updated":
+            updated_count += 1
+
+    return course_grade_count, created_count, updated_count, summary
+
+
+def render_recent_course_feedback():
+    feedback_items = get_course_grade_items(limit=30)
+    if not feedback_items:
+        st.info("No Quercus assignment feedback saved yet.")
+        return
+
+    st.markdown("#### Recent Assignment Feedback")
+    grouped_items = {}
+    for item in feedback_items:
+        grouped_items.setdefault(item.get("course_name") or "No course", []).append(item)
+
+    for course_name, items in grouped_items.items():
+        with st.expander(course_name, expanded=False):
+            for item in items[:10]:
+                with st.container(border=True):
+                    title = display_value(item.get("assignment_title"))
+                    st.markdown(f"**{title}**")
+                    columns = st.columns(4)
+                    columns[0].markdown(f"**Grade**  \n{display_value(item.get('grade'))}")
+                    score = item.get("score")
+                    points = item.get("points_possible")
+                    if score is not None and points is not None:
+                        score_text = f"{score:g} / {points:g}"
+                    elif score is not None:
+                        score_text = f"{score:g}"
+                    else:
+                        score_text = "Not set"
+                    columns[1].markdown(f"**Score**  \n{score_text}")
+                    columns[2].markdown(
+                        f"**Graded**  \n{display_task_datetime(item.get('graded_at'))}"
+                    )
+                    status_bits = []
+                    if item.get("late"):
+                        status_bits.append("Late")
+                    if item.get("missing"):
+                        status_bits.append("Missing")
+                    if item.get("excused"):
+                        status_bits.append("Excused")
+                    columns[3].markdown(
+                        f"**Status**  \n{', '.join(status_bits) if status_bits else display_value(item.get('workflow_state'))}"
+                    )
+                    if item.get("feedback_text"):
+                        st.markdown("**Instructor comments**")
+                        st.caption(item["feedback_text"])
+                    if item.get("rubric_json"):
+                        with st.expander("Rubric / raw feedback"):
+                            st.code(item["rubric_json"], language="json")
 
 
 def render_settings_workspace():

@@ -362,6 +362,38 @@ def _create_course_grades_table(cursor):
     ''')
 
 
+def _create_course_grade_items_table(cursor):
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS course_grade_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            external_id TEXT NOT NULL,
+            external_source TEXT NOT NULL,
+            course_id TEXT,
+            course_name TEXT,
+            assignment_id TEXT,
+            assignment_title TEXT,
+            grade TEXT,
+            score REAL,
+            points_possible REAL,
+            graded_at TEXT,
+            submitted_at TEXT,
+            posted_at TEXT,
+            late INTEGER DEFAULT 0 CHECK (late IN (0, 1)),
+            missing INTEGER DEFAULT 0 CHECK (missing IN (0, 1)),
+            excused INTEGER DEFAULT 0 CHECK (excused IN (0, 1)),
+            workflow_state TEXT,
+            html_url TEXT,
+            feedback_text TEXT,
+            rubric_json TEXT,
+            raw_json TEXT,
+            created_at TEXT,
+            updated_at TEXT,
+            last_seen_at TEXT,
+            UNIQUE(external_source, external_id)
+        )
+    ''')
+
+
 def _create_morning_checkins_table(cursor):
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS morning_checkins (
@@ -890,6 +922,7 @@ def init_db():
         _create_task_candidates_table(cursor)
         _create_course_archives_table(cursor)
         _create_course_grades_table(cursor)
+        _create_course_grade_items_table(cursor)
         _create_morning_checkins_table(cursor)
         _create_personal_commitments_table(cursor)
         _create_daily_commands_table(cursor)
@@ -3578,6 +3611,109 @@ def delete_course_grade(grade_id):
         cursor.execute("DELETE FROM course_grades WHERE id = ?", (grade_id,))
         conn.commit()
         return cursor.rowcount > 0
+
+
+def upsert_course_grade_item(item):
+    external_source = item.get("external_source") or "canvas_submission"
+    external_id = str(item.get("external_id") or "").strip()
+    if not external_id:
+        return "skipped"
+
+    now = datetime.now().isoformat(timespec="seconds")
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id
+            FROM course_grade_items
+            WHERE external_source = ? AND external_id = ?
+            LIMIT 1
+            ''',
+            (external_source, external_id),
+        )
+        exists = cursor.fetchone() is not None
+        cursor.execute(
+            '''
+            INSERT INTO course_grade_items (
+                external_id, external_source, course_id, course_name,
+                assignment_id, assignment_title, grade, score, points_possible,
+                graded_at, submitted_at, posted_at, late, missing, excused,
+                workflow_state, html_url, feedback_text, rubric_json, raw_json,
+                created_at, updated_at, last_seen_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(external_source, external_id) DO UPDATE SET
+                course_id = excluded.course_id,
+                course_name = excluded.course_name,
+                assignment_id = excluded.assignment_id,
+                assignment_title = excluded.assignment_title,
+                grade = excluded.grade,
+                score = excluded.score,
+                points_possible = excluded.points_possible,
+                graded_at = excluded.graded_at,
+                submitted_at = excluded.submitted_at,
+                posted_at = excluded.posted_at,
+                late = excluded.late,
+                missing = excluded.missing,
+                excused = excluded.excused,
+                workflow_state = excluded.workflow_state,
+                html_url = excluded.html_url,
+                feedback_text = excluded.feedback_text,
+                rubric_json = excluded.rubric_json,
+                raw_json = excluded.raw_json,
+                updated_at = excluded.updated_at,
+                last_seen_at = excluded.last_seen_at
+            ''',
+            (
+                external_id,
+                external_source,
+                item.get("course_id"),
+                item.get("course_name"),
+                item.get("assignment_id"),
+                item.get("assignment_title"),
+                item.get("grade"),
+                item.get("score"),
+                item.get("points_possible"),
+                item.get("graded_at"),
+                item.get("submitted_at"),
+                item.get("posted_at"),
+                1 if item.get("late") else 0,
+                1 if item.get("missing") else 0,
+                1 if item.get("excused") else 0,
+                item.get("workflow_state"),
+                item.get("html_url"),
+                item.get("feedback_text"),
+                item.get("rubric_json"),
+                item.get("raw_json"),
+                now,
+                now,
+                now,
+            ),
+        )
+        conn.commit()
+
+    return "updated" if exists else "created"
+
+
+def get_course_grade_items(limit=100):
+    limit = max(1, int(limit))
+    with closing(_connect()) as conn:
+        cursor = conn.cursor()
+        cursor.execute(
+            '''
+            SELECT id, external_id, external_source, course_id, course_name,
+                   assignment_id, assignment_title, grade, score,
+                   points_possible, graded_at, submitted_at, posted_at,
+                   late, missing, excused, workflow_state, html_url,
+                   feedback_text, rubric_json, raw_json, created_at,
+                   updated_at, last_seen_at
+            FROM course_grade_items
+            ORDER BY COALESCE(graded_at, posted_at, updated_at) DESC, id DESC
+            LIMIT ?
+            ''',
+            (limit,),
+        )
+        return [dict(row) for row in cursor.fetchall()]
 
 
 def _normalize_candidate(candidate):
